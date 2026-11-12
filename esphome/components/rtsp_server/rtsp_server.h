@@ -37,6 +37,7 @@ class RTSPServer : public Component, public camera::CameraListener {
  protected:
   void accept_new_connections_(uint32_t now);
   void socket_failed_(const char *what);
+  void open_listener_();
 
   socket::ListenSocket *socket_{nullptr};
   std::array<RTSPSession, MAX_RTSP_CONNECTIONS> sessions_{};
