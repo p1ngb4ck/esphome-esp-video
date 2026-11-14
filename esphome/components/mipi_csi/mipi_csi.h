@@ -20,6 +20,10 @@
 #include "esphome/core/helpers.h"
 
 #include "jpeg_encoder.h"
+#ifdef USE_CSI_VIDEO_OUTPUT
+#include "esphome/components/display/video_output.h"
+#include <driver/ppa.h>
+#endif
 
 namespace esphome::mipi_csi {
 
@@ -116,6 +120,24 @@ using BufferFree = void (*)(uint8_t *ptr);
 /// capture task and every buffer are set up then and given back after (the buffers from the allocator).
 class MipiCsiCamera final : public camera::Camera {
  public:
+  static constexpr uint8_t MAX_RESOLUTIONS = 8;
+  struct Resolution {
+    uint16_t width;
+    uint16_t height;
+    uint8_t fps;
+  };
+  void add_resolution(uint16_t width, uint16_t height, uint8_t fps);
+  uint8_t resolution_count() const { return this->resolution_count_; }
+  const Resolution &resolution(uint8_t index) const { return this->resolutions_[index]; }
+  bool switch_resolution(uint16_t width, uint16_t height);
+#ifdef USE_CSI_VIDEO_OUTPUT
+  void set_video_output(display::VideoOutput *output) { this->output_ = output; }
+  bool can_show(uint16_t width, uint16_t height, uint8_t fps) const {
+    return this->output_->fits(width, height, fps, false, this);
+  }
+  void show_on_canvas(bool on);
+  bool is_shown_on_canvas() const { return this->output_on_; }
+#endif
   void set_buffer_allocator(BufferAlloc alloc, BufferFree free) {
     this->alloc_ = alloc;
     this->free_ = free;
@@ -158,7 +180,10 @@ class MipiCsiCamera final : public camera::Camera {
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::LATE; }
 
-  void add_listener(camera::CameraListener *listener) override { this->listeners_.push_back(listener); }
+  void add_listener(camera::CameraListener *listener) override {
+    this->listeners_.push_back(listener);
+    camera::note_listener(this->listeners_, listener);
+  }
   camera::CameraImageReader *create_image_reader() override { return new MipiCsiImageReader(this); }  // NOLINT
   void request_image(camera::CameraRequester requester) override;
   void start_stream(camera::CameraRequester requester) override;
@@ -228,8 +253,10 @@ class MipiCsiCamera final : public camera::Camera {
   /// Main loop: the JPEG output (a pool piece) and the engine while API images are asked for; given back after.
   bool open_jpeg_();
   void close_jpeg_();
+  void release_own_jpeg_engine_();
   /// Logs every MIPI-CSI format the sensor offers, used when the configured resolution is rejected.
   void log_sensor_formats_();
+  void collect_resolutions_();
   /// Ranks two sensor formats of the same resolution against each other.
   bool is_better_sensor_format_(const esp_cam_sensor_format_t &candidate, const esp_cam_sensor_format_t &current) const;
   /// Reduces the configured frame rate to one the driver can actually produce.
@@ -284,6 +311,7 @@ class MipiCsiCamera final : public camera::Camera {
   BufferAlloc alloc_{nullptr};
   BufferFree free_{nullptr};
   jpeg_encoder_handle_t (*jpeg_engine_)(){nullptr};
+  jpeg_encoder_handle_t own_jpeg_engine_{nullptr};
   State state_{State::IDLE};
   bool video_ready_{false};
   FixedVector<FrameBuffer> buffers_;
@@ -322,6 +350,26 @@ class MipiCsiCamera final : public camera::Camera {
   std::atomic<bool> direct_ready_{false};
   bool direct_given_{false};
   CallbackManager<void(const uint8_t *, uint16_t, uint16_t)> direct_callback_;
+  Resolution resolutions_[MAX_RESOLUTIONS]{};
+  uint8_t resolution_count_{0};
+#ifdef USE_CSI_VIDEO_OUTPUT
+  bool holds_() const { return this->canvas_ != nullptr && this->canvas_->held_by(this); }
+  display::VideoOutput *output_{nullptr};
+  display::VideoCanvas *canvas_{nullptr};
+  bool output_on_{false};
+  bool fit_start_(const uint8_t *frame);
+  void fit_finish_();
+  void fit_free_();
+  static bool fit_done_cb_(ppa_client_handle_t client, ppa_event_data_t *event, void *arg);
+  ppa_client_handle_t fit_ppa_{nullptr};
+  uint8_t *fit_buf_[2]{nullptr, nullptr};
+  size_t fit_size_{0};
+  uint16_t fit_w_{0};
+  uint16_t fit_h_{0};
+  uint8_t fit_index_{0};
+  bool fit_busy_{false};
+  std::atomic<bool> fit_done_{false};
+#endif
 
   std::shared_ptr<MipiCsiImage> current_image_;
   std::vector<camera::CameraListener *> listeners_;

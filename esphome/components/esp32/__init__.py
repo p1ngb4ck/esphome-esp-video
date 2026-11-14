@@ -18,6 +18,7 @@ from esphome.components.const import (
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_ADVANCED,
+    CONF_API,
     CONF_BOARD,
     CONF_COMPONENTS,
     CONF_DISABLED,
@@ -25,6 +26,7 @@ from esphome.const import (
     CONF_ENABLE_OTA_ROLLBACK,
     CONF_ESPHOME,
     CONF_FRAMEWORK,
+    CONF_ID,
     CONF_IGNORE_EFUSE_CUSTOM_MAC,
     CONF_IGNORE_EFUSE_MAC_CRC,
     CONF_LOG_LEVEL,
@@ -53,13 +55,14 @@ from esphome.const import (
     Toolchain,
     __version__,
 )
-from esphome.core import CORE, EsphomeError, HexInt
+from esphome.core import CORE, ID, EsphomeError, HexInt, TimePeriod
 from esphome.core.config import BOARD_MAX_LENGTH
 from esphome.coroutine import CoroPriority, coroutine_with_priority
 from esphome.espidf import sbom
 from esphome.espidf.component import IDFComponent, generate_idf_components
+from esphome.espidf.toolchain import _get_idf_path
 import esphome.final_validate as fv
-from esphome.helpers import copy_file_if_changed, rmtree, write_file_if_changed
+from esphome.helpers import copy_file_if_changed, fnv1_hash, rmtree, write_file_if_changed
 from esphome.schema_extractors import SCHEMA_EXTRACT, schema_extractor
 from esphome.types import ConfigType
 from esphome.writer import clean_build, clean_cmake_cache
@@ -101,12 +104,30 @@ from .const import (
     VARIANT_ESP32S31,
     VARIANT_FRIENDLY,
     VARIANTS,
+    esp32_ns,
 )
 
 # force import gpio to register pin schema
 from .gpio import esp32_pin_to_code  # noqa: F401
 
 _LOGGER = logging.getLogger(__name__)
+
+CHIP_REVISION_ACTION = "chip_revision"
+ChipRevisionAction = esp32_ns.class_("ChipRevisionAction")
+NVS_ACTIONS = {
+    "nvs_list": esp32_ns.class_("NvsListAction"),
+    "nvs_erase": esp32_ns.class_("NvsEraseAction"),
+}
+FLASH_ACTIONS = {
+    "flash_info": esp32_ns.class_("FlashInfoAction"),
+    "flash_verify": esp32_ns.class_("FlashVerifyAction"),
+}
+COREDUMP_ACTIONS = {
+    "coredump_info": esp32_ns.class_("CoredumpInfoAction"),
+    "coredump_read": esp32_ns.class_("CoredumpReadAction"),
+    "coredump_erase": esp32_ns.class_("CoredumpEraseAction"),
+}
+
 AUTO_LOAD = ["preferences"]
 CODEOWNERS = ["@esphome/core"]
 DOMAIN = "esp32"
@@ -507,6 +528,16 @@ ESP32_CHIP_REVISIONS = {
     "3.0": "CONFIG_ESP32_REV_MIN_3",
     "3.1": "CONFIG_ESP32_REV_MIN_3_1",
 }
+ESP32P4_CHIP_REVISIONS = {
+    "0.0": "CONFIG_ESP32P4_REV_MIN_0",
+    "0.1": "CONFIG_ESP32P4_REV_MIN_1",
+    "1.0": "CONFIG_ESP32P4_REV_MIN_100",
+    "3.0": "CONFIG_ESP32P4_REV_MIN_300",
+    "3.1": "CONFIG_ESP32P4_REV_MIN_301",
+}
+ESP32P4_LESS_V3_REVISIONS = ("0.0", "0.1", "1.0")
+CHIP_REVISION_ENV = "ESPHOME_CHIP_REVISION"
+P4_MIN_REVISION_FAST_FLASH = ("80MHZ", "120MHZ")
 
 # Flash vendor drivers ESP-IDF can link; each costs IRAM plus a 124 B table in DRAM
 # and only the one matching the flash ID is ever used
@@ -521,6 +552,21 @@ ESP32_FLASH_CHIPS = {
 }
 FLASH_CHIP_GENERIC = "generic"
 FLASH_CHIP_OPI = "mxic_opi"  # the octal driver, ESP32-S3 only
+FLASH_ID_ENV = "ESPHOME_FLASH_ID"
+FLASH_MAX_FREQUENCY_ENV = "ESPHOME_FLASH_MAX_FREQUENCY"
+FLASH_VENDOR_IDS = {
+    0xC8: "gd",
+    0x9D: "issi",
+    0xC2: "mxic",
+    0xEF: "winbond",
+    0x68: "boya",
+    0xCD: "th",
+}
+FLASH_AUTO_FREQUENCY = "80MHZ"
+KEY_NVS_DEFAULTS = "nvs_defaults"
+NVS_DEFAULTS_CSV = "nvs_defaults.csv"
+NVS_DEFAULTS_PARTITION = "nvs"
+FLASH_SAFE_FREQUENCY = "40MHZ"
 
 # Socket limit configuration for ESP-IDF
 # ESP-IDF CONFIG_LWIP_MAX_SOCKETS has range 1-253, default 10
@@ -608,6 +654,15 @@ def _get_sdkconfig_cpu_frequencies(
     return selected, disabled
 
 
+def _warn_once(message: str, *args: Any) -> None:
+    warned = CORE.data.setdefault("esp32_config_warnings", set())
+    key = (message, *(str(arg) for arg in args))
+    if key in warned:
+        return
+    warned.add(key)
+    _LOGGER.warning(message, *args)
+
+
 def set_core_data(config):
     cpu_frequency = config.get(CONF_CPU_FREQUENCY)
     variant = config[CONF_VARIANT]
@@ -628,7 +683,7 @@ def set_core_data(config):
                 f"sdkconfig_options selects {sdkconfig_cpu_frequency}, which {variant} does not support",
                 path=sdkconfig_path,
             )
-        _LOGGER.warning(
+        _warn_once(
             "sdkconfig_options contains a CPU frequency setting; using %s. "
             "Set 'esp32.cpu_frequency' to configure it directly.",
             sdkconfig_cpu_frequency,
@@ -663,7 +718,7 @@ def set_core_data(config):
     config[CONF_CPU_FREQUENCY] = cpu_frequency
 
     if variant == VARIANT_ESP32P4 and cpu_frequency == "400MHZ":
-        _LOGGER.warning(
+        _warn_once(
             "400MHz on ESP32-P4 is experimental and may not boot. "
             "Consider using 360MHz instead. See https://github.com/esphome/esphome/issues/13425"
         )
@@ -1169,6 +1224,25 @@ def add_src_cmake(block: str) -> None:
     CORE.data[KEY_ESP32][KEY_SRC_CMAKE].append(block)
 
 
+def add_nvs_default(namespace: str, key: str, data: bytes) -> None:
+    defaults = CORE.data[KEY_ESP32].setdefault(KEY_NVS_DEFAULTS, {})
+    if not defaults:
+        CORE.add_job(_write_nvs_defaults)
+    defaults.setdefault(namespace, {})[key] = data
+
+
+@coroutine_with_priority(CoroPriority.FINAL)
+async def _write_nvs_defaults() -> None:
+    lines = ["key,type,encoding,value"]
+    for namespace, entries in CORE.data[KEY_ESP32][KEY_NVS_DEFAULTS].items():
+        lines.append(f"{namespace},namespace,,")
+        lines.extend(f"{key},data,hex2bin,{data.hex()}" for key, data in entries.items())
+    write_file_if_changed(CORE.relative_build_path(NVS_DEFAULTS_CSV), "\n".join(lines) + "\n")
+    add_src_cmake(
+        f"nvs_create_partition_image({NVS_DEFAULTS_PARTITION} ${{CMAKE_SOURCE_DIR}}/{NVS_DEFAULTS_CSV})"
+    )
+
+
 def add_extra_build_file(filename: str, path: Path) -> bool:
     """Add an extra build file to the project."""
     if filename not in CORE.data[KEY_ESP32][KEY_EXTRA_BUILD_FILES]:
@@ -1354,7 +1428,7 @@ def _resolve_framework_version(value: ConfigType) -> cv.Version:
         recommended = ESP_IDF_FRAMEWORK_VERSION_LOOKUP["recommended"]
 
     if version != recommended:
-        _LOGGER.warning(
+        _warn_once(
             "The selected framework version is not the recommended one. "
             "If there are connectivity or build issues please remove the manual version."
         )
@@ -1414,7 +1488,7 @@ def _check_pio_versions(config: ConfigType) -> ConfigType:
     if value[CONF_PLATFORM_VERSION] != _parse_pio_platform_version(
         str(PLATFORM_VERSION_LOOKUP["recommended"])
     ):
-        _LOGGER.warning(
+        _warn_once(
             "The selected platform version is not the recommended one. "
             "If there are connectivity or build issues please remove the manual version."
         )
@@ -1435,7 +1509,7 @@ def _check_esp_idf_versions(config: ConfigType) -> ConfigType:
     version = _resolve_framework_version(value)
 
     if CONF_SOURCE in value:
-        _LOGGER.warning(
+        _warn_once(
             "A custom framework source is set. "
             "If there are connectivity or build issues please remove the manual source."
         )
@@ -1472,11 +1546,41 @@ def _parse_pio_platform_version(value):
         return value
 
 
+def detected_chip_revision() -> int | None:
+    try:
+        revision = int(os.environ.get(CHIP_REVISION_ENV, ""))
+    except ValueError:
+        return None
+    return revision if 0 <= revision <= 9999 else None
+
+
+def _revision_text(revision: int) -> str:
+    return f"{revision // 100}.{revision % 100}"
+
+
+def _revision_key(text: str) -> int:
+    major, minor = text.split(".")
+    return int(major) * 100 + int(minor)
+
+
 def _normalize_p4_engineering_sample(value: ConfigType) -> bool:
     """Fill in CONF_ENGINEERING_SAMPLE when unset, warning that production
     silicon (rev3) is assumed. Returns the normalized flag."""
+    if (detected := detected_chip_revision()) is not None:
+        engineering_sample = detected < 300
+        if (explicit := value.get(CONF_ENGINEERING_SAMPLE)) is None:
+            value[CONF_ENGINEERING_SAMPLE] = engineering_sample
+            return engineering_sample
+        if explicit != engineering_sample:
+            _warn_once(
+                "'%s: %s' does not match the detected chip revision v%s; the configured value is used",
+                CONF_ENGINEERING_SAMPLE,
+                explicit,
+                _revision_text(detected),
+            )
+        return explicit
     if (engineering_sample := value.get(CONF_ENGINEERING_SAMPLE)) is None:
-        _LOGGER.warning(
+        _warn_once(
             "Defaulting to ESP32-P4 production silicon (rev3).\n"
             "If you have an early engineering sample (pre-rev3), add this to your config:\n"
             "\n"
@@ -1490,6 +1594,81 @@ def _normalize_p4_engineering_sample(value: ConfigType) -> bool:
         engineering_sample = False
         value[CONF_ENGINEERING_SAMPLE] = engineering_sample
     return engineering_sample
+
+
+def _apply_detected_chip_revision(value: ConfigType) -> ConfigType:
+    if (detected := detected_chip_revision()) is None:
+        return value
+    variant = value[CONF_VARIANT]
+    if variant == VARIANT_ESP32:
+        choices = list(ESP32_CHIP_REVISIONS)
+    elif variant == VARIANT_ESP32P4:
+        choices = [
+            rev
+            for rev in ESP32P4_CHIP_REVISIONS
+            if (rev in ESP32P4_LESS_V3_REVISIONS) == bool(value.get(CONF_ENGINEERING_SAMPLE))
+        ]
+    else:
+        return value
+    fitting = [rev for rev in choices if _revision_key(rev) <= detected]
+    if not fitting:
+        return value
+    auto = max(fitting, key=_revision_key)
+    framework = value.get(CONF_FRAMEWORK, {})
+    advanced = framework.get(CONF_ADVANCED, {})
+    if (explicit := advanced.get(CONF_MINIMUM_CHIP_REVISION)) is None:
+        value = value.copy()
+        value[CONF_FRAMEWORK] = {
+            **framework,
+            CONF_ADVANCED: {**advanced, CONF_MINIMUM_CHIP_REVISION: auto},
+        }
+    elif explicit != auto:
+        _warn_once(
+            "'%s: %s' does not match the detected chip revision v%s (auto: %s); the configured value is used",
+            CONF_MINIMUM_CHIP_REVISION,
+            explicit,
+            _revision_text(detected),
+            auto,
+        )
+    return value
+
+
+def detected_flash_id() -> int | None:
+    try:
+        flash_id = int(os.environ.get(FLASH_ID_ENV, ""), 16)
+    except ValueError:
+        return None
+    return flash_id if 0 < flash_id <= 0xFFFFFF else None
+
+
+def _apply_detected_flash(value: ConfigType) -> ConfigType:
+    if (flash_id := detected_flash_id()) is None:
+        return value
+    vendor = FLASH_VENDOR_IDS.get(flash_id >> 16)
+    auto_chip = vendor or FLASH_CHIP_GENERIC
+    framework = value.get(CONF_FRAMEWORK, {})
+    advanced = framework.get(CONF_ADVANCED, {})
+    value = value.copy()
+    if advanced.get(CONF_FLASH_CHIP) is None:
+        advanced = {**advanced, CONF_FLASH_CHIP: auto_chip}
+        value[CONF_FRAMEWORK] = {**framework, CONF_ADVANCED: advanced}
+    if value[CONF_VARIANT] != VARIANT_ESP32P4:
+        return value
+    limited = os.environ.get(FLASH_MAX_FREQUENCY_ENV, "").upper() == FLASH_SAFE_FREQUENCY
+    fast = (
+        vendor is not None
+        and advanced.get(CONF_MINIMUM_CHIP_REVISION) not in (None, "0.0")
+        and not limited
+    )
+    auto_frequency = FLASH_AUTO_FREQUENCY if fast else FLASH_SAFE_FREQUENCY
+    if limited:
+        _warn_once(
+            "The flash check of this device failed at a higher speed; auto is %s",
+            FLASH_SAFE_FREQUENCY,
+        )
+    if value.get(CONF_FLASH_FREQUENCY) is None:
+        value[CONF_FLASH_FREQUENCY] = auto_frequency
+    return value
 
 
 def _detect_variant(value):
@@ -1542,7 +1721,7 @@ def _detect_variant(value):
             path=[CONF_BOARD],
         )
     else:
-        _LOGGER.warning(
+        _warn_once(
             "This board is unknown; the specified variant '%s' will be used but this may not work as expected.",
             variant,
         )
@@ -1825,15 +2004,51 @@ def final_validate(config) -> None:
                 path=[CONF_FRAMEWORK, CONF_ADVANCED, CONF_IGNORE_EFUSE_MAC_CRC],
             )
         )
-    if (
-        config[CONF_VARIANT] != VARIANT_ESP32
-        and advanced.get(CONF_MINIMUM_CHIP_REVISION) is not None
-    ):
+    min_rev = advanced.get(CONF_MINIMUM_CHIP_REVISION)
+    if min_rev is not None and config[CONF_VARIANT] == VARIANT_ESP32P4:
+        if min_rev not in ESP32P4_CHIP_REVISIONS:
+            errs.append(
+                cv.Invalid(
+                    f"'{CONF_MINIMUM_CHIP_REVISION}' on {VARIANT_ESP32P4} is one of "
+                    f"{', '.join(ESP32P4_CHIP_REVISIONS)}",
+                    path=[CONF_FRAMEWORK, CONF_ADVANCED, CONF_MINIMUM_CHIP_REVISION],
+                )
+            )
+        elif (min_rev in ESP32P4_LESS_V3_REVISIONS) != bool(config.get(CONF_ENGINEERING_SAMPLE)):
+            errs.append(
+                cv.Invalid(
+                    f"'{CONF_MINIMUM_CHIP_REVISION}: {min_rev}' does not match "
+                    f"'{CONF_ENGINEERING_SAMPLE}: {bool(config.get(CONF_ENGINEERING_SAMPLE))}'",
+                    path=[CONF_FRAMEWORK, CONF_ADVANCED, CONF_MINIMUM_CHIP_REVISION],
+                )
+            )
+    elif min_rev is not None and config[CONF_VARIANT] == VARIANT_ESP32:
+        if min_rev not in ESP32_CHIP_REVISIONS:
+            errs.append(
+                cv.Invalid(
+                    f"'{CONF_MINIMUM_CHIP_REVISION}' on {VARIANT_ESP32} is one of "
+                    f"{', '.join(ESP32_CHIP_REVISIONS)}",
+                    path=[CONF_FRAMEWORK, CONF_ADVANCED, CONF_MINIMUM_CHIP_REVISION],
+                )
+            )
+    elif min_rev is not None:
         errs.append(
             cv.Invalid(
-                f"'{CONF_MINIMUM_CHIP_REVISION}' is only supported on {VARIANT_ESP32}",
+                f"'{CONF_MINIMUM_CHIP_REVISION}' is only supported on {VARIANT_ESP32} and {VARIANT_ESP32P4}",
                 path=[CONF_FRAMEWORK, CONF_ADVANCED, CONF_MINIMUM_CHIP_REVISION],
             )
+        )
+    if (
+        config[CONF_VARIANT] == VARIANT_ESP32P4
+        and config.get(CONF_FLASH_FREQUENCY) in P4_MIN_REVISION_FAST_FLASH
+        and min_rev in (None, "0.0")
+    ):
+        _LOGGER.warning(
+            "'%s: %s' needs '%s' 0.1 or higher on %s; ESP-IDF builds with 40MHz otherwise",
+            CONF_FLASH_FREQUENCY,
+            config[CONF_FLASH_FREQUENCY],
+            CONF_MINIMUM_CHIP_REVISION,
+            VARIANT_ESP32P4,
         )
     if config[CONF_VARIANT] != VARIANT_ESP32S3 and config.get(CONF_FLASH_MODE) == "opi":
         errs.append(
@@ -2097,6 +2312,34 @@ CONF_FREERTOS_IN_IRAM = "freertos_in_iram"
 CONF_RINGBUF_IN_IRAM = "ringbuf_in_iram"
 CONF_HEAP_IN_IRAM = "heap_in_iram"
 CONF_LOOP_TASK_STACK_SIZE = "loop_task_stack_size"
+CONF_BOOT_RAM_PROBE = "boot_ram_probe"
+CONF_COMPONENTS_IN_PSRAM = "components_in_psram"
+KEY_COMPONENTS_IN_PSRAM = "components_in_psram"
+# The .bss of the generated main.cpp (every component object's static storage) in PSRAM: an IDF
+# component holding only this linker fragment. ESP-IDF's PSRAM noinit section (extram_noinit), not its
+# PSRAM .bss: turning that on moves Bluetooth's and lwIP's .bss too (they get slower there). Noinit is not
+# zeroed at startup, so app_main() zeroes the range between the SURROUND symbols first.
+_COMPONENTS_IN_PSRAM_LF = """[sections:esphome_main_bss]
+entries:
+    .bss+
+
+[sections:esphome_main_common]
+entries:
+    COMMON
+
+[scheme:esphome_main_extram_noinit]
+entries:
+    esphome_main_bss -> extram_noinit
+    esphome_main_common -> extram_noinit
+
+[mapping:esphome_main_bss_psram]
+archive: libsrc.a
+entries:
+    if SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY = y:
+        main (esphome_main_extram_noinit);
+            esphome_main_bss -> extram_noinit ALIGN(4) ALIGN(4, post) SURROUND(esphome_main_bss),
+            esphome_main_common -> extram_noinit ALIGN(4) ALIGN(4, post) SURROUND(esphome_main_common)
+"""
 CONF_USE_FULL_CERTIFICATE_BUNDLE = "use_full_certificate_bundle"
 CONF_DISABLE_DEBUG_STUBS = "disable_debug_stubs"
 CONF_DISABLE_OCD_AWARE = "disable_ocd_aware"
@@ -2109,6 +2352,7 @@ CONF_DISABLE_MBEDTLS_TLS_SERVER = "disable_mbedtls_tls_server"
 CONF_DISABLE_MBEDTLS_TLS_EXTRAS = "disable_mbedtls_tls_extras"
 CONF_DISABLE_REGI2C_IN_IRAM = "disable_regi2c_in_iram"
 CONF_DISABLE_FATFS = "disable_fatfs"
+CONF_ENABLE_EXFAT = "enable_exfat"
 CONF_ADC_ONESHOT_IN_IRAM = "adc_oneshot_in_iram"
 
 # VFS requirement tracking
@@ -2120,6 +2364,15 @@ KEY_VFS_TERMIOS_REQUIRED = "vfs_termios_required"
 # These are stored in CORE.data[KEY_ESP32] dict
 KEY_USB_SERIAL_JTAG_SECONDARY_REQUIRED = "usb_serial_jtag_secondary_required"
 KEY_FATFS_REQUIRED = "fatfs_required"
+KEY_FATFS_VOLUMES = "fatfs_volumes"
+# FAT volumes beyond the configured mounts, for mounts that come and go at runtime (USB
+# sticks taken by a wildcard entry, say).
+FATFS_SPARE_VOLUMES = 3
+FATFS_MAX_VOLUMES = 10  # Kconfig range of CONFIG_FATFS_VOLUME_COUNT
+# CONFIG_VFS_MAX_COUNT: its Kconfig default (what registers before any FAT mount: console,
+# sockets, eventfd, ...) plus one entry per FAT volume; Kconfig range up to 20.
+VFS_BASE_COUNT = 8
+VFS_COUNT_LIMIT = 20
 KEY_ADC_ONESHOT_IRAM_REQUIRED = "adc_oneshot_iram_required"
 KEY_LIBC_PICOLIBC_NEWLIB_COMPAT_REQUIRED = "libc_picolibc_newlib_compat_required"
 
@@ -2172,6 +2425,10 @@ def require_certificate_bundle() -> None:
     # esp_crt_bundle.c lives in the mbedtls component and calls
     # mbedtls_ssl_conf_*, so a bundle needs the TLS role but not esp-tls.
     require_mbedtls_tls()
+    # A TLS client verifying a server via the bundle needs SHA-384/SHA-512: servers commonly
+    # negotiate SHA-384 cipher suites and present certs signed with SHA-384, so requesting the
+    # bundle implies requiring SHA-384/SHA-512.
+    _mbedtls_sdkconfig().sha512_required = True
     CORE.data[KEY_ESP32][KEY_CERT_BUNDLE] = True
 
 
@@ -2275,13 +2532,17 @@ def require_idf_version(
     return validator
 
 
-def require_fatfs() -> None:
+def require_fatfs(volumes: int = 0) -> None:
     """Mark that FATFS support is required by a component.
 
     Call this from components that use FATFS (e.g., SD card, storage components).
     This prevents FATFS from being disabled when disable_fatfs is set.
+    volumes: the FAT volumes the caller mounts; CONFIG_FATFS_VOLUME_COUNT is sized from their sum.
     """
     CORE.data[KEY_ESP32][KEY_FATFS_REQUIRED] = True
+    CORE.data[KEY_ESP32][KEY_FATFS_VOLUMES] = (
+        CORE.data[KEY_ESP32].get(KEY_FATFS_VOLUMES, 0) + volumes
+    )
 
 
 def require_adc_oneshot_iram() -> None:
@@ -2352,7 +2613,7 @@ FRAMEWORK_SCHEMA = cv.Schema(
                 cv.Optional(CONF_IGNORE_EFUSE_CUSTOM_MAC, default=False): cv.boolean,
                 cv.Optional(CONF_IGNORE_EFUSE_MAC_CRC, default=False): cv.boolean,
                 cv.Optional(CONF_MINIMUM_CHIP_REVISION): cv.one_of(
-                    *ESP32_CHIP_REVISIONS, string=True
+                    *dict.fromkeys([*ESP32_CHIP_REVISIONS, *ESP32P4_CHIP_REVISIONS]), string=True
                 ),
                 cv.Optional(CONF_SRAM1_AS_IRAM, default=False): cv.boolean,
                 cv.Optional(CONF_FLASH_CHIP): cv.one_of(
@@ -2378,6 +2639,7 @@ FRAMEWORK_SCHEMA = cv.Schema(
                 cv.Optional(CONF_DISABLE_VFS_SUPPORT_TERMIOS, default=True): cv.boolean,
                 cv.Optional(CONF_DISABLE_VFS_SUPPORT_SELECT, default=True): cv.boolean,
                 cv.Optional(CONF_DISABLE_VFS_SUPPORT_DIR, default=True): cv.boolean,
+                cv.Optional(CONF_ENABLE_EXFAT, default=False): cv.boolean,
                 cv.Optional(CONF_FREERTOS_IN_IRAM, default=False): cv.boolean,
                 cv.Optional(CONF_RINGBUF_IN_IRAM, default=False): cv.boolean,
                 cv.Optional(CONF_HEAP_IN_IRAM, default=False): cv.boolean,
@@ -2386,6 +2648,13 @@ FRAMEWORK_SCHEMA = cv.Schema(
                 cv.Optional(CONF_LOOP_TASK_STACK_SIZE, default=8192): cv.int_range(
                     min=8192, max=32768
                 ),
+                # A measurement: internal and internal DMA free RAM sampled every millisecond for the
+                # first 90 s, its changes logged afterwards (a task with its stack in PSRAM, gone then).
+                cv.Optional(CONF_BOOT_RAM_PROBE, default=False): cv.boolean,
+                # The component objects (their static storage, often 100 KB and more) in PSRAM instead
+                # of internal RAM. Needs PSRAM executing the firmware (execute_from_psram): a flash
+                # operation then does not turn the PSRAM cache off, so interrupts may still use them.
+                cv.Optional(CONF_COMPONENTS_IN_PSRAM, default=False): cv.boolean,
                 cv.Optional(CONF_ENABLE_OTA_ROLLBACK, default=True): cv.boolean,
                 cv.Optional(
                     CONF_ENABLE_OTA_DOWNGRADE_PROTECTION, default=False
@@ -2565,6 +2834,8 @@ CONFIG_SCHEMA = cv.All(
     _resolve_toolchain,
     _detect_variant,
     _set_default_framework,
+    _apply_detected_chip_revision,
+    _apply_detected_flash,
     _check_versions,
     set_core_data,
     _require_ipv4_on_arduino,
@@ -2656,6 +2927,53 @@ def register_exclude_components_cmake_arg() -> None:
     """Register the current exclusion set as the EXCLUDE_COMPONENTS cmake arg."""
     if excluded := get_excluded_builtin_components():
         cg.add_cmake_arg("EXCLUDE_COMPONENTS", ";".join(excluded))
+
+
+def has_coredump_partition(config: ConfigType) -> bool:
+    partitions = config.get(CONF_PARTITIONS)
+    if isinstance(partitions, list):
+        return any(partition[CONF_SUBTYPE] == "coredump" for partition in partitions)
+    if partitions is None:
+        return False
+    try:
+        text = Path(CORE.relative_config_path(partitions)).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        cells = [cell.strip() for cell in line.split("#", 1)[0].split(",")]
+        if len(cells) >= 3 and cells[1] == "data" and cells[2] == "coredump":
+            return True
+    return False
+
+
+@coroutine_with_priority(CoroPriority.FINAL)
+async def _add_api_actions() -> None:
+    if CONF_API not in CORE.config:
+        return
+    cg.add_define("USE_ESP32_CHIP_REVISION_ACTION")
+    cg.add_define("USE_API_USER_DEFINED_ACTIONS")
+    cg.add_define("USE_API_CUSTOM_SERVICES")
+    cg.add_define("USE_API_USER_DEFINED_ACTION_RESPONSES")
+    cg.add_define("USE_API_USER_DEFINED_ACTION_RESPONSES_JSON")
+    api = await cg.get_variable(CORE.config[CONF_API][CONF_ID])
+    action = cg.new_Pvariable(
+        ID("esp32_chip_revision_action", True, ChipRevisionAction),
+        fnv1_hash(CHIP_REVISION_ACTION),
+    )
+    cg.add(api.register_user_service(action))
+    cg.add_define("USE_ESP32_FLASH_ACTIONS")
+    for name, action_class in FLASH_ACTIONS.items():
+        action = cg.new_Pvariable(ID(f"esp32_{name}_action", True, action_class), fnv1_hash(name))
+        cg.add(api.register_user_service(action))
+    cg.add_define("USE_ESP32_NVS_ACTIONS")
+    for name, action_class in NVS_ACTIONS.items():
+        action = cg.new_Pvariable(ID(f"esp32_{name}_action", True, action_class), fnv1_hash(name))
+        cg.add(api.register_user_service(action))
+    if has_coredump_partition(CORE.config[PLATFORM_ESP32]):
+        cg.add_define("USE_ESP32_COREDUMP_ACTIONS")
+        for name, action_class in COREDUMP_ACTIONS.items():
+            action = cg.new_Pvariable(ID(f"esp32_{name}_action", True, action_class), fnv1_hash(name))
+            cg.add(api.register_user_service(action))
 
 
 @coroutine_with_priority(CoroPriority.FINAL)
@@ -2943,7 +3261,16 @@ async def _reconcile_network_sdkconfig() -> None:
         set_idf_sdkconfig_default("CONFIG_ESP_COEX_SW_COEXIST_ENABLE", False)
 
     # SoftAP support: drop it when WiFi is used without AP mode (IDF only).
-    if not is_arduino and net.wifi and not net.wifi_ap:
+    # Skip on esp32_hosted — symbol is owned by the co-processor component.
+    # Skip on IDF >= 6.1.0 — the symbol's Kconfig dependency is no longer satisfied there,
+    # so IDF disables it and flags any user-set value as a "disabled symbol" warning.
+    if (
+        not is_arduino
+        and net.wifi
+        and not net.wifi_ap
+        and "esp32_hosted" not in CORE.config
+        and idf_version() < cv.Version(6, 1, 0)
+    ):
         set_idf_sdkconfig_default("CONFIG_ESP_WIFI_SOFTAP_SUPPORT", False)
 
     # LWIP DHCP server: a WiFi-AP-mode / enable_lwip_dhcp_server concern (not
@@ -2971,51 +3298,161 @@ async def _add_yaml_idf_components(components: list[ConfigType]):
 
 
 @coroutine_with_priority(CoroPriority.FINAL)
+async def _patch_idf_kconfig_files():
+    """Patch IDF 6.1.0 Kconfig files that use 'default 0' for bool symbols.
+
+    Newer Kconfig parsers reject 'default 0' for boolean symbols and emit
+    warnings. Patch in-place before cmake runs.
+    """
+    if idf_version() < cv.Version(6, 1, 0):
+        return
+    idf_base = _get_idf_path()
+    if idf_base is None:
+        return
+    # Each entry: (glob_pattern, old_string, new_string)
+    # Exact surrounding context prevents accidental matches on other symbols.
+    fixes = [
+        (
+            "components/bt/**/Kconfig.in",
+            'config BT_NIMBLE_MESH_PROVISIONER\n        bool "Enable BLE mesh provisioner"\n        default 0\n',
+            'config BT_NIMBLE_MESH_PROVISIONER\n        bool "Enable BLE mesh provisioner"\n        default n\n',
+        ),
+        (
+            "components/fatfs/Kconfig",
+            '        bool "Make fatfs f_printf() support long long argument"\n        default 0\n',
+            '        bool "Make fatfs f_printf() support long long argument"\n        default n\n',
+        ),
+        (
+            "components/fatfs/Kconfig",
+            '        bool "Make fatfs f_printf() support floating point argument"\n        default 0\n',
+            '        bool "Make fatfs f_printf() support floating point argument"\n        default n\n',
+        ),
+    ]
+    for pattern, old, new in fixes:
+        for kconfig_path in idf_base.glob(pattern):
+            if not kconfig_path.is_file():
+                continue
+            original = kconfig_path.read_text()
+            if old in original:
+                kconfig_path.write_text(original.replace(old, new, 1))
+                _LOGGER.debug("Patched Kconfig default in %s", kconfig_path)
+
+
+@coroutine_with_priority(CoroPriority.FINAL)
 async def _reconcile_vfs_fatfs_sdkconfig(
     disable_vfs_termios: bool,
     disable_vfs_select: bool,
     disable_vfs_dir: bool,
     disable_fatfs: bool,
+    enable_exfat: bool,
 ) -> None:
-    """Reconcile VFS/FATFS sdkconfig flags after all require_*() calls; user sdkconfig_options win."""
+    """Reconcile VFS/FATFS sdkconfig flags.
+
+    Runs at FINAL priority so every require_vfs_termios()/require_vfs_select()/
+    require_vfs_dir()/require_fatfs() call (made from the various components' to_code at
+    their own priorities) is seen first. A user-supplied sdkconfig_options value always
+    takes precedence.
+    """
     opts = CORE.data[KEY_ESP32][KEY_SDKCONFIG_OPTIONS]
 
-    # USB Serial JTAG VFS needs termios (require_vfs_termios(), e.g. logger). ~1.8KB flash when off.
+    # VFS support for termios (terminal I/O functions)
+    # USB Serial JTAG VFS functions require termios support.
+    # Components that need it (e.g., logger when USB_SERIAL_JTAG is supported but not selected
+    # as the logger output) call require_vfs_termios().
+    # Saves approximately 1.8KB of flash when disabled (default).
     if CORE.data.get(KEY_VFS_TERMIOS_REQUIRED, False):
         set_idf_sdkconfig_default("CONFIG_VFS_SUPPORT_TERMIOS", True)
     else:
         set_idf_sdkconfig_default("CONFIG_VFS_SUPPORT_TERMIOS", not disable_vfs_termios)
 
-    # VFS select is only needed for UART/eventfd fds (require_vfs_select(), e.g. openthread);
-    # sockets use lwip_select() either way. ~2.7KB flash when off.
+    # VFS support for select() with file descriptors
+    # ESPHome only uses select() with sockets via lwip_select(), which still works.
+    # VFS select is only needed for UART/eventfd file descriptors.
+    # Components that need it (e.g., openthread) call require_vfs_select().
+    # Saves approximately 2.7KB of flash when disabled (default).
     if CORE.data.get(KEY_VFS_SELECT_REQUIRED, False):
         set_idf_sdkconfig_default("CONFIG_VFS_SUPPORT_SELECT", True)
     else:
         set_idf_sdkconfig_default("CONFIG_VFS_SUPPORT_SELECT", not disable_vfs_select)
 
-    # Directory functions: opendir/readdir/mkdir etc. (require_vfs_dir()). ~0.5KB flash when off.
+    # VFS support for directory functions (opendir, readdir, mkdir, etc.)
+    # Components that need it (e.g., storage drivers) call require_vfs_dir().
+    # Saves approximately 0.5KB+ of flash when disabled (default).
     if CORE.data.get(KEY_VFS_DIR_REQUIRED, False):
         set_idf_sdkconfig_default("CONFIG_VFS_SUPPORT_DIR", True)
     else:
         set_idf_sdkconfig_default("CONFIG_VFS_SUPPORT_DIR", not disable_vfs_dir)
 
-    # FATFS (require_fatfs()): LFN + one volume per esp_vfs_fat mount. Defaults only;
-    # sdkconfig_options override. FATFS_LONG_FILENAMES is a Kconfig choice -- if the user set
-    # any member, leave the group alone. LFN_HEAP allocates per LFN op; LFN_STACK uses stack.
-    lfn_keys = (
-        "CONFIG_FATFS_LFN_NONE",
-        "CONFIG_FATFS_LFN_HEAP",
-        "CONFIG_FATFS_LFN_STACK",
-    )
-    user_picked_lfn = any(k in opts for k in lfn_keys)
+    # FATFS support
+    # Components that need FATFS (SD card, USB storage, ...) call require_fatfs().
     if CORE.data[KEY_ESP32].get(KEY_FATFS_REQUIRED, False):
-        if not user_picked_lfn:
+        # Storage drivers need long filenames (heap-allocated, full 255-char length) and
+        # enough FATFS volumes for several drivers at once (SD + USB + wear levelling —
+        # every esp_vfs_fat mount consumes one). All of these are only defaults: override
+        # any of them via esp32 -> framework -> advanced -> sdkconfig_options.
+        lfn_choice_keys = (
+            "CONFIG_FATFS_LFN_NONE",
+            "CONFIG_FATFS_LFN_HEAP",
+            "CONFIG_FATFS_LFN_STACK",
+        )
+        if not any(k in opts for k in lfn_choice_keys):
             set_idf_sdkconfig_default("CONFIG_FATFS_LFN_NONE", False)
             set_idf_sdkconfig_default("CONFIG_FATFS_LFN_HEAP", True)
+        if not opts.get("CONFIG_FATFS_LFN_NONE", False):
             set_idf_sdkconfig_default("CONFIG_FATFS_MAX_LFN", 255)
-        set_idf_sdkconfig_default("CONFIG_FATFS_VOLUME_COUNT", 4)
+        volumes = (
+            CORE.data[KEY_ESP32].get(KEY_FATFS_VOLUMES, 0) + FATFS_SPARE_VOLUMES
+        )
+        if volumes > FATFS_MAX_VOLUMES:
+            _LOGGER.warning(
+                "%d FAT volumes configured, ESP-IDF supports at most %d",
+                volumes - FATFS_SPARE_VOLUMES,
+                FATFS_MAX_VOLUMES,
+            )
+        # At least one volume per configured mount: a smaller sdkconfig_options value is raised.
+        volumes = min(volumes, FATFS_MAX_VOLUMES)
+        user_volumes = opts.get("CONFIG_FATFS_VOLUME_COUNT")
+        if isinstance(user_volumes, RawSdkconfigValue):
+            user_volumes = user_volumes.value
+        if user_volumes is None or int(str(user_volumes).strip('"')) < volumes:
+            add_idf_sdkconfig_option("CONFIG_FATFS_VOLUME_COUNT", volumes)
+        else:
+            volumes = int(str(user_volumes).strip('"'))
+        # Every FAT mount is a VFS entry too (esp_vfs_fat_register -> esp_vfs_register_fs,
+        # ESP_ERR_NO_MEM once the table is full): a smaller sdkconfig_options value is raised.
+        vfs_count = min(VFS_BASE_COUNT + volumes, VFS_COUNT_LIMIT)
+        user_vfs = opts.get("CONFIG_VFS_MAX_COUNT")
+        if isinstance(user_vfs, RawSdkconfigValue):
+            user_vfs = user_vfs.value
+        if user_vfs is None or int(str(user_vfs).strip('"')) < vfs_count:
+            add_idf_sdkconfig_option("CONFIG_VFS_MAX_COUNT", vfs_count)
+        # Long filenames are a hard requirement of exFAT and are already set right above;
+        # the FatFs #defines themselves come via a patched component copy, declared in the
+        # manifest so it replaces the built-in fatfs and lands in src's REQUIRES.
+        exfat_override = _sync_exfat_fatfs_override(
+            enable_exfat,
+            str(CORE.data[KEY_ESP32][KEY_IDF_VERSION]),
+            get_esp32_variant(),
+        )
+        if exfat_override is not None:
+            add_idf_component(name="fatfs", override_path=exfat_override)
+        else:
+            add_src_cmake(
+                "idf_component_get_property(esphome_fatfs_lib fatfs COMPONENT_LIB)\n"
+                "target_link_libraries(${COMPONENT_LIB} PUBLIC ${esphome_fatfs_lib})"
+            )
+    elif enable_exfat:
+        raise cv.Invalid(
+            f"'{CONF_ENABLE_EXFAT}' has no effect here: no component in this configuration "
+            f"mounts a FAT filesystem, so the FatFs library is not part of the build"
+        )
     elif disable_fatfs:
-        if not user_picked_lfn:
+        lfn_choice_keys = (
+            "CONFIG_FATFS_LFN_NONE",
+            "CONFIG_FATFS_LFN_HEAP",
+            "CONFIG_FATFS_LFN_STACK",
+        )
+        if not any(k in opts for k in lfn_choice_keys):
             set_idf_sdkconfig_default("CONFIG_FATFS_LFN_NONE", True)
         # Kconfig range is [1,10]; 0 gets clamped to the default.
         set_idf_sdkconfig_default("CONFIG_FATFS_VOLUME_COUNT", 1)
@@ -3050,6 +3487,15 @@ async def _finalize_arduino_aware_flags():
 
 async def to_code(config):
     framework_ver: cv.Version = CORE.data[KEY_CORE][KEY_FRAMEWORK_VERSION]
+    if get_esp32_variant() == VARIANT_ESP32P4:
+        # esp_restart_noos() resets the other core before stalling it; a cache sync of that core in flight then
+        # faults the restart's own Cache_WriteBack_All (store access fault on CACHE_SYNC_MAP_REG) or hangs it
+        # (espressif/esp-idf#19171). restart_fix.cpp stalls it and waits for the sync engine first.
+        cg.add_build_flag("-Wl,--wrap=esp_restart_noos")
+        cg.add_define("USE_ESP32_P4_RESTART_FIX")
+        cg.add_build_flag("-Wl,--wrap=heap_caps_malloc_default")
+        cg.add_build_flag("-Wl,--undefined=__wrap_heap_caps_malloc_default")
+        cg.add_define("USE_ESP32_P4_SMALL_ALLOC_RETENTION")
     conf = config[CONF_FRAMEWORK]
 
     # Check if using ESP-IDF toolchain
@@ -3275,6 +3721,11 @@ async def to_code(config):
             for rev, flag in ESP32_CHIP_REVISIONS.items():
                 add_idf_sdkconfig_option(flag, rev == min_rev)
             cg.add_define("USE_ESP32_MIN_CHIP_REVISION_SET")
+    elif variant == VARIANT_ESP32P4:
+        min_rev = conf[CONF_ADVANCED].get(CONF_MINIMUM_CHIP_REVISION)
+        if min_rev is not None:
+            for rev, flag in ESP32P4_CHIP_REVISIONS.items():
+                add_idf_sdkconfig_option(flag, rev == min_rev)
 
     # Keep only the flash vendor driver the board needs; the boot log names it
     if (flash_chip := conf[CONF_ADVANCED].get(CONF_FLASH_CHIP)) is not None:
@@ -3352,7 +3803,11 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_LOG_TAG_LEVEL_IMPL_NONE", True)
 
     # Reduce PHY TX power in the event of a brownout
-    add_idf_sdkconfig_option("CONFIG_ESP_PHY_REDUCE_TX_POWER", True)
+    # Not applicable on esp32_hosted — PHY lives on the co-processor
+    # Not applicable on IDF >= 6.1.0 — the symbol's Kconfig dependency is no longer
+    # satisfied there, so IDF disables it and flags any user-set value as a warning.
+    if "esp32_hosted" not in CORE.config and idf_version() < cv.Version(6, 1, 0):
+        add_idf_sdkconfig_option("CONFIG_ESP_PHY_REDUCE_TX_POWER", True)
 
     # Set default CPU frequency
     add_idf_sdkconfig_option(
@@ -3414,6 +3869,11 @@ async def to_code(config):
 
     if use_platformio:
         cg.add_platformio_option("board_build.partitions", "partitions.csv")
+    if has_coredump_partition(config):
+        include_builtin_idf_component("espcoredump")
+        add_idf_sdkconfig_option("CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH", True)
+        add_idf_sdkconfig_option("CONFIG_ESP_COREDUMP_ENABLE_TO_NONE", False)
+        add_idf_sdkconfig_option("CONFIG_ESP_COREDUMP_LOGS", False)
     if CONF_PARTITIONS in config:
         if isinstance(config[CONF_PARTITIONS], list):
             for partition in config[CONF_PARTITIONS]:
@@ -3587,6 +4047,14 @@ async def to_code(config):
         )
 
     cg.add_define("ESPHOME_LOOP_TASK_STACK_SIZE", advanced[CONF_LOOP_TASK_STACK_SIZE])
+    if advanced[CONF_BOOT_RAM_PROBE]:
+        cg.add_define("USE_ESP32_BOOT_RAM_PROBE")
+    if advanced[CONF_COMPONENTS_IN_PSRAM]:
+        if not advanced[CONF_EXECUTE_FROM_PSRAM]:
+            raise cv.Invalid(f"{CONF_COMPONENTS_IN_PSRAM} needs {CONF_EXECUTE_FROM_PSRAM}")
+        add_idf_sdkconfig_option("CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY", True)
+        cg.add_define("USE_ESP32_COMPONENTS_IN_PSRAM")
+        CORE.data[KEY_ESP32][KEY_COMPONENTS_IN_PSRAM] = True
 
     cg.add_define(
         "USE_ESP_IDF_VERSION_CODE",
@@ -3626,8 +4094,8 @@ async def to_code(config):
     # FINAL priority: runs after every network/coexistence request_*() call
     CORE.add_job(_reconcile_network_sdkconfig)
 
-    # FINAL priority: runs after every require_certificate_bundle() call
-    CORE.add_job(_reconcile_certificate_bundle_sdkconfig)
+    # FINAL priority: patch IDF 6.1.0 Kconfig 'default 0' bool symbols before cmake runs
+    CORE.add_job(_patch_idf_kconfig_files)
 
     # FINAL priority: runs after every request_tls() / require_mbedtls_*() call
     mbedtls = _mbedtls_sdkconfig()
@@ -3638,14 +4106,16 @@ async def to_code(config):
     mbedtls.disable_pkcs7 = advanced[CONF_DISABLE_MBEDTLS_PKCS7]
     CORE.add_job(_reconcile_mbedtls_sdkconfig)
 
-    # FINAL: require_*() calls can come from to_code at or below this priority, so an
-    # inline read would be iteration-order-dependent; reconcile once after every job ran.
+    # FINAL priority: runs after every require_vfs_*() / require_fatfs() call — components
+    # make those calls from their own to_code, which runs after this platform to_code, so
+    # reading the flags inline here would never see them (VFS/FATFS would stay disabled).
     CORE.add_job(
         _reconcile_vfs_fatfs_sdkconfig,
         advanced[CONF_DISABLE_VFS_SUPPORT_TERMIOS],
         advanced[CONF_DISABLE_VFS_SUPPORT_SELECT],
         advanced[CONF_DISABLE_VFS_SUPPORT_DIR],
         advanced[CONF_DISABLE_FATFS],
+        advanced[CONF_ENABLE_EXFAT],
     )
 
     # Disable regi2c control functions in IRAM
@@ -3677,6 +4147,16 @@ async def to_code(config):
     if conf[CONF_COMPONENTS]:
         CORE.add_job(_add_yaml_idf_components, conf[CONF_COMPONENTS])
 
+    # JPEG backend selection at FINAL priority, after all components have had a chance to call
+    # require_hw_jpeg(). Must be scheduled BEFORE _write_exclude_components below: it calls
+    # include_builtin_idf_component() (for the P4 case), and same-priority jobs run in
+    # registration order, so this has to be queued first or the exclude list would already be
+    # finalized with esp_driver_jpeg still excluded. _init_hw_jpeg() self-guards on the
+    # esp32_hw_jpeg_required flag and no-ops if nothing requested it.
+    CORE.add_job(_init_hw_jpeg)
+    CORE.add_job(_init_h264_encoder)
+    CORE.add_job(_add_api_actions)
+
     # Write EXCLUDE_COMPONENTS at FINAL priority after all components have had
     # a chance to call include_builtin_idf_component() to re-enable components they need.
     # Default exclusions are added in set_core_data() during config validation.
@@ -3689,6 +4169,241 @@ async def to_code(config):
 
 
 KEY_CUSTOM_PARTITIONS = "custom_partitions"
+
+
+_EXFAT_PATCHES = (
+    ("FF_FS_EXFAT", "1"),
+    # exFAT on a card driven over SPI trips the TRIM path (ESP_ERR_INVALID_RESPONSE);
+    # TRIM is an optimisation for the medium, not a feature anything depends on.
+    ("FF_USE_TRIM", "0"),
+)
+_EXFAT_MARKER = ".esphome_exfat_override"
+_REGISTRY_MARKER = ".esphome_registry_patch"
+
+
+def sync_registry_component(
+    namespace: str, name: str, version: str, patches: Iterable[tuple[str, str, str]]
+) -> str:
+    import hashlib
+    import io
+    import shutil
+    import zipfile
+
+    from esphome.external_files import compute_local_file_path, download_content
+
+    patches = tuple(patches)
+    url = (
+        f"https://components-file.espressif.com/components/{namespace}/{name}/{version}/"
+        f"{namespace}__{name}-v{version.replace('~', '_')}.zip"
+    )
+    stamp = hashlib.sha256(repr((url, patches)).encode()).hexdigest()
+    dest = Path(CORE.build_path) / "components-src" / f"{namespace}__{name}"
+    marker = dest / _REGISTRY_MARKER
+    if marker.is_file() and marker.read_text() == stamp:
+        return str(dest)
+    archive = download_content(url, compute_local_file_path("esp32", url))
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        zf.extractall(dest)
+    for rel, old, new in patches:
+        target = dest / rel
+        text = target.read_text(encoding="utf-8") if target.is_file() else ""
+        if text.count(old) != 1:
+            raise cv.Invalid(
+                f"{namespace}/{name} {version}: the patch of {rel} does not apply "
+                f"-- the text it replaces is missing or appears more than once"
+            )
+        target.write_text(text.replace(old, new, 1), encoding="utf-8")
+    marker.write_text(stamp)
+    return str(dest)
+
+
+CMAKE_MINIMUM_PATCH = ("cmake_minimum_required(VERSION 3.5)", "cmake_minimum_required(VERSION 3.5...3.10)")
+
+
+def _sync_exfat_fatfs_override(enabled: bool, idf_ver: str, variant: str) -> str | None:
+    """Patch a copy of FatFs so exFAT is compiled in; return its path when enabled.
+
+    exFAT is a plain #define in FatFs (no Kconfig symbol), so the only way to turn it on is a
+    patched copy of the component. The copy sits outside every component search path
+    (<build>/components-src/fatfs, like the usb_host override) and the caller declares it via
+    add_idf_component(override_path=...). The component manager then registers it as a
+    project-managed component -- added after the IDF built-ins, so it replaces the built-in
+    fatfs -- and injects it into src's REQUIRES from the manifest, which is what puts ff.h
+    on the include path of the storage drivers. The directory name must stay "fatfs": IDF
+    names a component after its directory. Synced every codegen and stamped with the IDF
+    version so an IDF switch re-copies; a copy nobody points at is inert."""
+    import shutil
+
+    from esphome.espidf.framework import _get_framework_path, check_esp_idf_install
+
+    # Earlier revisions kept the copy in <build>/components, which IDF scans on its own and
+    # which outranks the manifest; a copy left there would shadow this one or keep exFAT on.
+    legacy = Path(CORE.build_path) / "components" / "fatfs"
+    if (legacy / _EXFAT_MARKER).is_file():
+        shutil.rmtree(legacy)
+
+    dest = Path(CORE.build_path) / "components-src" / "fatfs"
+    marker = dest / _EXFAT_MARKER
+    stamp = f"v4:{idf_ver}:" + ",".join(f"{k}={v}" for k, v in _EXFAT_PATCHES)
+    if not enabled:
+        # Only remove what is provably ours.
+        if marker.is_file():
+            shutil.rmtree(dest)
+        return None
+    if marker.is_file() and marker.read_text() == stamp:
+        return str(dest)  # current copy is up to date
+    src = _get_framework_path(idf_ver) / "components" / "fatfs"
+    if not src.is_dir():
+        # First-ever build: the toolchain would install the IDF minutes from now anyway —
+        # front-load it so the copy source exists.
+        check_esp_idf_install(idf_ver, targets=[variant])
+    if not src.is_dir():
+        raise cv.Invalid(
+            "enable_exfat: cannot locate the ESP-IDF fatfs component to patch "
+            f"(looked in {src})"
+        )
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest)
+    ffconf = dest / "src" / "ffconf.h"
+    text = ffconf.read_text()
+    for key, value in _EXFAT_PATCHES:
+        text, n = re.subn(
+            rf"#define[ \t]+{key}[ \t]+\S+", f"#define {key} {value}", text
+        )
+        if n != 1:
+            raise cv.Invalid(
+                f"enable_exfat: patching {key} in the IDF's ffconf.h failed — "
+                f"unexpected FatFs layout in IDF {idf_ver}"
+            )
+    # Kconfig bool symbols that are disabled produce no #define, yet ff.c uses several of
+    # them in plain C expressions (e.g. `if (FF_USE_LABEL && vol)`) — inside the original
+    # IDF component that resolves, in a project-component copy it surfaced as 'undeclared
+    # identifier'. Default every CONFIG_ symbol the header references to 0 when undefined:
+    # a no-op for anything sdkconfig.h defines, and exactly the value a disabled bool means
+    # otherwise. Scanned generically so new symbols in future IDF versions are covered.
+    # Only symbols used in *value* contexts and probed nowhere: defining a symbol that any
+    # compiled source probes with #ifdef/defined() makes the probe true and silently
+    # enables the guarded code — vfs_fat.c does exactly that with USE_FASTSEEK (its
+    # fastseek block then references FIL::cltbl, which the ffconf side correctly compiled
+    # out). So the probe scan covers the whole copied component, not just ffconf.h;
+    # test_apps/host_test/fatfs_utils are excluded because they are never built and their
+    # probes must not suppress legitimate guards.
+    probed = set()
+    skip_dirs = {"test_apps", "host_test", "fatfs_utils"}
+    for f in dest.rglob("*"):
+        if f.suffix not in (".c", ".h") or skip_dirs & {
+            part.name for part in f.parents
+        }:
+            continue
+        for line in f.read_text(errors="replace").splitlines():
+            if re.search(r"#\s*if(n?def)?\b", line) or "defined" in line:
+                probed.update(re.findall(r"\bCONFIG_[A-Z0-9_]+\b", line))
+    symbols = sorted(set(re.findall(r"\bCONFIG_[A-Z0-9_]+\b", text)) - probed)
+    guards = "".join(f"#ifndef {sym}\n#define {sym} 0\n#endif\n" for sym in symbols)
+    include_line = '#include "sdkconfig.h"\n'
+    if include_line not in text:
+        raise cv.Invalid(
+            "enable_exfat: unexpected ffconf.h layout — no sdkconfig.h include to anchor on"
+        )
+    text = text.replace(
+        include_line,
+        include_line
+        + "\n/* ESPHome exFAT override: undefined-symbol guards, see codegen */\n"
+        + guards,
+        1,
+    )
+    ffconf.write_text(text)
+    marker.write_text(stamp)
+    return str(dest)
+
+
+_SDMMC_MARKER = ".esphome_sdmmc_auto_stop"
+_SDMMC_TRANS = "src/sd_trans_sdmmc.c"
+_SDMMC_PATCHES = (
+    (
+        "    xSemaphoreTake(slot_ctx->ctlr->mutex, portMAX_DELAY);\n",
+        "    xSemaphoreTake(slot_ctx->ctlr->mutex, portMAX_DELAY);\n"
+        "    const bool auto_stop_wait = cmdinfo->data != NULL && cmd_needs_auto_stop(cmdinfo);\n",
+    ),
+    (
+        "    sd_host_handle_idle_state_events(slot_ctx);\n",
+        "    sd_host_handle_idle_state_events(slot_ctx);\n"
+        "    if (auto_stop_wait) {\n"
+        "        portENTER_CRITICAL(&slot_ctx->ctlr->spinlock);\n"
+        "        sdmmc_ll_clear_interrupt(slot_ctx->ctlr->hal.dev, SDMMC_LL_EVENT_ACD);\n"
+        "        sdmmc_ll_enable_interrupt(slot_ctx->ctlr->hal.dev, SDMMC_LL_EVENT_ACD, true);\n"
+        "        portEXIT_CRITICAL(&slot_ctx->ctlr->spinlock);\n"
+        "    }\n",
+    ),
+    (
+        "    slot_ctx->ctlr->is_app_cmd = (ret == ESP_OK && cmdinfo->opcode == MMC_APP_CMD);\n",
+        "    if (auto_stop_wait) {\n"
+        "        uint32_t stop_seen = unhandled_events.sdmmc_status;\n"
+        "        while (ret == ESP_OK && (stop_seen & SDMMC_LL_EVENT_ACD) == 0) {\n"
+        "            sd_host_sdmmc_event_t stop_evt = {};\n"
+        "            if (sd_host_wait_for_event(slot_ctx, cmdinfo->timeout_ms / portTICK_PERIOD_MS, &stop_evt) != ESP_OK) {\n"
+        "                ret = ESP_ERR_TIMEOUT;\n"
+        "                break;\n"
+        "            }\n"
+        "            stop_seen |= stop_evt.sdmmc_status;\n"
+        "        }\n"
+        "    }\n"
+        "    slot_ctx->ctlr->is_app_cmd = (ret == ESP_OK && cmdinfo->opcode == MMC_APP_CMD);\n",
+    ),
+    (
+        "out:\n#if CONFIG_PM_ENABLE\n",
+        "out:\n"
+        "    if (auto_stop_wait) {\n"
+        "        portENTER_CRITICAL(&slot_ctx->ctlr->spinlock);\n"
+        "        sdmmc_ll_enable_interrupt(slot_ctx->ctlr->hal.dev, SDMMC_LL_EVENT_ACD, false);\n"
+        "        portEXIT_CRITICAL(&slot_ctx->ctlr->spinlock);\n"
+        "    }\n"
+        "#if CONFIG_PM_ENABLE\n",
+    ),
+    (
+        '        ESP_LOGD(TAG, "%s: error 0x%x  (status=%08"PRIx32")", __func__, err, status);\n',
+        '        ESP_LOGE(TAG, "%s: error 0x%x  (status=%08"PRIx32")", __func__, err, status);\n',
+    ),
+    (
+        '        ESP_LOGD(TAG, "%s: error 0x%x (status=%08"PRIx32")", __func__, cmd->error, status);\n',
+        '        ESP_LOGE(TAG, "%s: error 0x%x (status=%08"PRIx32")", __func__, cmd->error, status);\n',
+    ),
+)
+
+
+def add_sdmmc_auto_stop_fix() -> None:
+    import shutil
+
+    from esphome.espidf.framework import _get_framework_path, check_esp_idf_install
+
+    idf_ver = str(CORE.data[KEY_ESP32][KEY_IDF_VERSION])
+    src = _get_framework_path(idf_ver) / "components" / "esp_driver_sdmmc"
+    if not src.is_dir():
+        check_esp_idf_install(idf_ver, targets=[get_esp32_variant()])
+    if not (src / _SDMMC_TRANS).is_file():
+        return
+    dest = Path(CORE.build_path) / "components-src" / "esp_driver_sdmmc"
+    marker = dest / _SDMMC_MARKER
+    stamp = f"v2:{idf_ver}"
+    if not (marker.is_file() and marker.read_text() == stamp):
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest)
+        trans = dest / _SDMMC_TRANS
+        text = trans.read_text()
+        for old, new in _SDMMC_PATCHES:
+            if text.count(old) != 1:
+                raise cv.Invalid(
+                    f"sd_storage: the SDMMC auto stop patch does not fit {_SDMMC_TRANS} of IDF {idf_ver}"
+                )
+            text = text.replace(old, new, 1)
+        trans.write_text(text)
+        marker.write_text(stamp)
+    add_idf_component(name="esp_driver_sdmmc", override_path=str(dest))
 
 
 @dataclass
@@ -3711,6 +4426,13 @@ EEPROM_SIZE = 0x1000  # Arduino only
 SPIFFS_SIZE = 0xF000  # Arduino only
 ARDUINO_NVS_SIZE = 0x60000
 IDF_NVS_SIZE = 0x70000
+IDF_NVS_SIZE_WITH_EXTERNAL = 0x5000
+
+
+def _idf_nvs_size() -> int:
+    if (CORE.config.get("preferences") or {}).get("external_nvs") is not None:
+        return IDF_NVS_SIZE_WITH_EXTERNAL
+    return IDF_NVS_SIZE
 
 
 def _get_partition_overhead() -> int:
@@ -3726,7 +4448,7 @@ def _get_partition_overhead() -> int:
     if CORE.using_arduino:
         overhead += EEPROM_SIZE + SPIFFS_SIZE + ARDUINO_NVS_SIZE
     else:
-        overhead += IDF_NVS_SIZE
+        overhead += _idf_nvs_size()
     return overhead
 
 
@@ -3848,7 +4570,7 @@ def get_partition_csv(flash_size_mb: str) -> str:
         )
     else:
         partitions.append(
-            PartitionEntry(name="nvs", type="data", subtype="nvs", size=IDF_NVS_SIZE)
+            PartitionEntry(name="nvs", type="data", subtype="nvs", size=_idf_nvs_size())
         )
     partitions.extend(CORE.data[KEY_ESP32].get(KEY_CUSTOM_PARTITIONS, {}).values())
 
@@ -4048,6 +4770,13 @@ def _write_idf_component_yml():
                 dependency["override_path"] = component[KEY_OVERRIDE_PATH]
             dependencies[name] = dependency
 
+    if CORE.data[KEY_ESP32].get(KEY_COMPONENTS_IN_PSRAM):
+        lf_dir = CORE.relative_build_path("component_stubs") / "esphome_bss_psram"
+        lf_dir.mkdir(parents=True, exist_ok=True)
+        write_file_if_changed(lf_dir / "linker.lf", _COMPONENTS_IN_PSRAM_LF)
+        write_file_if_changed(lf_dir / "CMakeLists.txt", 'idf_component_register(LDFRAGMENTS "linker.lf")' + chr(10))
+        dependencies["esphome_bss_psram"] = {"override_path": str(lf_dir)}
+
     contents = yaml_util.dump({"dependencies": dependencies}) if dependencies else ""
     if write_file_if_changed(yml_path, contents):
         dependencies_lock = CORE.relative_build_path("dependencies.lock")
@@ -4213,3 +4942,68 @@ def process_stacktrace(config, line, backtrace_state):
             _decode_pc(config, addr.group())
 
     return backtrace_state
+
+
+# ========== Hardware JPEG Decoder/Encoder ==========
+
+
+def require_hw_jpeg():
+    """Register requirement for hardware JPEG codec.
+
+    Platform-specific initialization:
+    - ESP32-P4: Hardware JPEG codec (esp_driver_jpeg, built into ESP-IDF)
+    - ESP32-S2/S3: esp_new_jpeg (optimized with SIMD)
+    - Other ESP32: JPEGDEC fallback (software, bodmer/JPEGDecoder)
+
+    This registers a requirement flag; the actual initialization runs as a
+    final-priority coroutine so any component can call require_hw_jpeg()
+    during their to_code() and the correct implementation is chosen.
+    """
+    CORE.data["esp32_hw_jpeg_required"] = True
+
+
+@coroutine_with_priority(CoroPriority.FINAL)
+async def _init_hw_jpeg() -> None:
+    """Final coroutine: initialize JPEG codec based on platform and requirements."""
+    if not CORE.data.get("esp32_hw_jpeg_required", False):
+        return
+
+    if not CORE.is_esp32:
+        _LOGGER.warning("HW JPEG only available on ESP32")
+        return
+
+    variant = get_esp32_variant()
+
+    if variant == VARIANT_ESP32P4:
+        # esp_driver_jpeg (built into ESP-IDF core) is not in
+        # DEFAULT_EXCLUDED_IDF_COMPONENTS -- available by default, same as the old
+        # transcoder component's P4 branch (picture_viewer's original working code) never
+        # needed to re-include anything for it either.
+        cg.add_define("USE_HWJPG")
+        _LOGGER.info("Enabled hardware JPEG codec (ESP32-P4)")
+
+    elif variant in (VARIANT_ESP32S2, VARIANT_ESP32S3):
+        add_idf_component(name="espressif/esp_new_jpeg", ref="1.0.0")
+        cg.add_define("USE_NEWJPEG")
+        _LOGGER.info("Enabled esp_new_jpeg codec (ESP32-%s)", variant)
+
+    else:
+        cg.add_library(
+            "JPEGDEC",
+            "1.8.4",
+            "https://github.com/esphome-libs/JPEGDEC#1.8.4-esphome.4",
+        )
+        cg.add_define("USE_JPEGDEC")
+        _LOGGER.info("Using JPEGDec library (software, ESP32-%s)", variant)
+
+
+def require_h264_encoder():
+    CORE.data["esp32_h264_encoder_required"] = True
+
+
+@coroutine_with_priority(CoroPriority.FINAL)
+async def _init_h264_encoder() -> None:
+    if not CORE.data.get("esp32_h264_encoder_required", False):
+        return
+    if CORE.is_esp32 and get_esp32_variant() == VARIANT_ESP32P4:
+        add_idf_component(name="espressif/esp_h264", ref="1.4.1")
