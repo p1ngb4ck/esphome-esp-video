@@ -6,6 +6,7 @@
 #include <cinttypes>
 #include <utility>
 
+#include "esphome/components/network/util.h"
 #include "esphome/core/application.h"
 #include "esphome/core/log.h"
 
@@ -20,7 +21,7 @@ void RTSPServer::socket_failed_(const char *what) {
   this->mark_failed();
 }
 
-void RTSPServer::setup() {
+void RTSPServer::open_listener_() {
   this->socket_ = socket::socket_ip_loop_monitored(SOCK_STREAM, 0).release();
   if (this->socket_ == nullptr) {
     ESP_LOGE(TAG, "Socket creation failed: errno %d", errno);
@@ -45,9 +46,10 @@ void RTSPServer::setup() {
 
   if (this->socket_->listen(4) != 0) {
     this->socket_failed_("listen");
-    return;
   }
+}
 
+void RTSPServer::setup() {
   camera::Camera *camera = camera::Camera::instance();
   if (camera == nullptr) {
     ESP_LOGE(TAG, "No camera");
@@ -73,6 +75,11 @@ void RTSPServer::set_format(camera::ImageFormat format) {
 
 void RTSPServer::loop() {
   const uint32_t now = App.get_loop_component_start_time();
+  if (this->socket_ == nullptr && network::is_connected()) {
+    this->open_listener_();
+    if (this->socket_ == nullptr)
+      return;
+  }
   if (this->socket_ != nullptr && this->socket_->ready()) {
     this->accept_new_connections_(now);
   }
