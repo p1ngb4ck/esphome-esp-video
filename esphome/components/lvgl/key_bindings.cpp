@@ -472,8 +472,98 @@ uint32_t KeyBindings::actions_hash_() const {
   return fnv1_hash(names);
 }
 
+#if defined(USE_LVGL_KEY_BINDINGS_FILE) && defined(USE_STORAGE_WORKER)
+void KeyBindings::file_free_() {
+  if (this->file_buf_ != nullptr)
+    RAMAllocator<uint8_t>(RAMAllocator<uint8_t>::ALLOC_EXTERNAL).deallocate(this->file_buf_, this->file_len_);
+  this->file_buf_ = nullptr;
+  this->file_len_ = 0;
+  this->file_got_ = 0;
+  this->file_busy_ = false;
+}
+
+void KeyBindings::file_read_end_(bool ok) {
+  storage::global_storage_worker->end_read(this->file_stream_, [this, ok](storage::StorageError) {
+    if (ok) {
+      this->decode_(reinterpret_cast<const char *>(this->file_buf_), this->file_got_);
+      ESP_LOGD(TAG, "Read %s", this->file_);
+      this->loaded_ = true;
+    }
+    this->file_free_();
+  });
+}
+
+void KeyBindings::file_read_next_() {
+  if (this->file_got_ >= this->file_len_) {
+    this->file_read_end_(true);
+    return;
+  }
+  this->file_step_ = 0;
+  const storage::StorageError err = storage::global_storage_worker->read_chunk(
+      this->file_stream_, this->file_buf_ + this->file_got_, this->file_len_ - this->file_got_, &this->file_step_,
+      [this](storage::StorageError e) {
+        if (e != storage::StorageError::STORAGE_ERROR_OK) {
+          this->file_read_end_(false);
+          return;
+        }
+        if (this->file_step_ == 0) {
+          this->file_read_end_(true);
+          return;
+        }
+        this->file_got_ += this->file_step_;
+        this->file_read_next_();
+      });
+  if (err != storage::StorageError::STORAGE_ERROR_OK)
+    this->file_read_end_(false);
+}
+#endif
+
 bool KeyBindings::load_() {
-#ifdef USE_LVGL_KEY_BINDINGS_FILE
+#if defined(USE_LVGL_KEY_BINDINGS_FILE) && defined(USE_STORAGE_WORKER)
+  if (this->file_ != nullptr) {
+    if (this->file_busy_ || storage::global_storage_registry == nullptr || storage::global_storage_worker == nullptr)
+      return false;
+    const char *rel = nullptr;
+    storage::PathStorage *ps = storage::global_storage_registry->resolve_path(this->file_, &rel);
+    if (ps == nullptr)
+      return false;
+    this->file_busy_ = true;
+    this->file_stat_ = storage::FileStat{};
+    const storage::StorageError err =
+        storage::global_storage_worker->async_stat(ps, rel, &this->file_stat_, [this, ps, rel](storage::StorageError e) {
+          if (e == storage::StorageError::STORAGE_ERROR_NOT_FOUND || (e == storage::StorageError::STORAGE_ERROR_OK &&
+                                                                      this->file_stat_.size == 0)) {
+            this->file_busy_ = false;
+            this->loaded_ = true;
+            return;
+          }
+          if (e != storage::StorageError::STORAGE_ERROR_OK || this->file_stat_.is_dir) {
+            this->file_busy_ = false;
+            return;
+          }
+          this->file_len_ = static_cast<size_t>(this->file_stat_.size);
+          this->file_buf_ = RAMAllocator<uint8_t>(RAMAllocator<uint8_t>::ALLOC_EXTERNAL).allocate(this->file_len_);
+          if (this->file_buf_ == nullptr) {
+            this->file_free_();
+            return;
+          }
+          this->file_got_ = 0;
+          const storage::StorageError r = storage::global_storage_worker->begin_read(
+              ps, rel, &this->file_stream_, [this](storage::StorageError b) {
+                if (b != storage::StorageError::STORAGE_ERROR_OK) {
+                  this->file_free_();
+                  return;
+                }
+                this->file_read_next_();
+              });
+          if (r != storage::StorageError::STORAGE_ERROR_OK)
+            this->file_free_();
+        });
+    if (err != storage::StorageError::STORAGE_ERROR_OK)
+      this->file_busy_ = false;
+    return false;
+  }
+#elif defined(USE_LVGL_KEY_BINDINGS_FILE)
   if (this->file_ != nullptr) {
     if (storage::global_storage_registry == nullptr)
       return false;
@@ -506,7 +596,62 @@ bool KeyBindings::load_() {
 }
 
 bool KeyBindings::save_() {
-#ifdef USE_LVGL_KEY_BINDINGS_FILE
+#if defined(USE_LVGL_KEY_BINDINGS_FILE) && defined(USE_STORAGE_WORKER)
+  if (this->file_ != nullptr) {
+    if (this->file_busy_ || storage::global_storage_registry == nullptr || storage::global_storage_worker == nullptr)
+      return false;
+    const char *rel = nullptr;
+    storage::PathStorage *ps = storage::global_storage_registry->resolve_path(this->file_, &rel);
+    if (ps == nullptr)
+      return false;
+    {
+      const std::string text = this->encode_();
+      this->file_buf_ = RAMAllocator<uint8_t>(RAMAllocator<uint8_t>::ALLOC_EXTERNAL).allocate(text.size() + 1);
+      if (this->file_buf_ == nullptr)
+        return false;
+      this->file_len_ = text.size() + 1;
+      this->file_got_ = text.size();
+      std::memcpy(this->file_buf_, text.data(), text.size());
+    }
+    this->file_busy_ = true;
+    auto failed = [this](storage::StorageError e) {
+      ESP_LOGW(TAG, "Writing %s failed (%u), retrying", this->file_, static_cast<unsigned>(e));
+      this->dirty_ = true;
+      this->file_free_();
+    };
+    const storage::StorageError err = storage::global_storage_worker->begin_write(
+        ps, rel, &this->file_stream_, [this, failed](storage::StorageError b) {
+          if (b != storage::StorageError::STORAGE_ERROR_OK) {
+            failed(b);
+            return;
+          }
+          if (this->file_got_ == 0) {
+            storage::global_storage_worker->end_write(this->file_stream_,
+                                                      [this](storage::StorageError) { this->file_free_(); });
+            return;
+          }
+          const storage::StorageError w = storage::global_storage_worker->write_chunk(
+              this->file_stream_, this->file_buf_, this->file_got_, [this, failed](storage::StorageError e) {
+                storage::global_storage_worker->end_write(this->file_stream_, [this, failed, e](storage::StorageError c) {
+                  if (e != storage::StorageError::STORAGE_ERROR_OK || c != storage::StorageError::STORAGE_ERROR_OK) {
+                    failed(e != storage::StorageError::STORAGE_ERROR_OK ? e : c);
+                    return;
+                  }
+                  this->file_free_();
+                });
+              });
+          if (w != storage::StorageError::STORAGE_ERROR_OK) {
+            storage::global_storage_worker->end_write(this->file_stream_,
+                                                      [failed, w](storage::StorageError) { failed(w); });
+          }
+        });
+    if (err != storage::StorageError::STORAGE_ERROR_OK) {
+      this->file_free_();
+      return false;
+    }
+    return true;
+  }
+#elif defined(USE_LVGL_KEY_BINDINGS_FILE)
   if (this->file_ != nullptr) {
     if (storage::global_storage_registry == nullptr)
       return false;
