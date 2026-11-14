@@ -7,7 +7,6 @@
 #include "esphome/components/network/util.h"
 #include "esphome/core/application.h"
 #include "esphome/core/defines.h"
-#include "esphome/core/entity_settings.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include "esphome/core/util.h"
@@ -18,9 +17,6 @@
 
 #ifdef USE_LOGGER
 #include "esphome/components/logger/logger.h"
-#endif
-#ifdef USE_SAFE_MODE_SPLIT
-#include "esphome/components/safe_mode/safe_mode.h"
 #endif
 
 #include <algorithm>
@@ -70,7 +66,6 @@ void APIServer::socket_failed_(const LogString *msg) {
 }
 
 void APIServer::setup() {
-  global_entity_settings.load();
 #if defined(USE_API_HOMEASSISTANT_STATES) && defined(HOMEASSISTANT_STATE_SUBSCRIPTION_COUNT)
   this->state_subs_.reserve(HOMEASSISTANT_STATE_SUBSCRIPTION_COUNT);
 #endif
@@ -96,13 +91,10 @@ void APIServer::setup() {
 #endif
 
 #ifdef USE_CAMERA
-  if (camera::Camera::instance() != nullptr && !camera::Camera::instance()->is_internal() &&
-      !this->is_hidden(camera::Camera::instance())) {
+  if (camera::Camera::instance() != nullptr && !camera::Camera::instance()->is_internal()) {
     camera::Camera::instance()->add_listener(this);
   }
 #endif
-
-  App.add_on_entities_changed_callback([this]() { this->defer("relist", [this]() { this->relist_clients(); }); });
 
   // Initialize last_connected_ for reboot timeout tracking
   this->last_connected_ = App.get_loop_component_start_time();
@@ -179,13 +171,7 @@ void APIServer::setup() {
 
 void APIServer::loop() {
   // Accept new clients only if the socket exists and has incoming connections
-#ifdef USE_SAFE_MODE_SPLIT
-  const bool accepting =
-      safe_mode::global_safe_mode_component == nullptr || safe_mode::global_safe_mode_component->tiers_ready();
-#else
-  const bool accepting = true;
-#endif
-  if (accepting && this->socket_ && this->socket_->ready()) {
+  if (this->socket_ && this->socket_->ready()) {
     this->accept_new_connections_();
   }
 
@@ -409,7 +395,7 @@ void APIServer::handle_disconnect(APIConnection *conn) {}
 // Macro for controller update dispatch
 #define API_DISPATCH_UPDATE(entity_type, entity_name) \
   void APIServer::on_##entity_name##_update(entity_type *obj) { /* NOLINT(bugprone-macro-parentheses) */ \
-    if (obj->is_internal() || this->is_hidden(obj)) \
+    if (obj->is_internal()) \
       return; \
     for (auto &c : this->active_clients()) { \
       if (c->flags_.state_subscription) \
@@ -491,7 +477,7 @@ API_DISPATCH_UPDATE(water_heater::WaterHeater, water_heater)
 
 #ifdef USE_EVENT
 void APIServer::on_event(event::Event *obj) {
-  if (obj->is_internal() || this->is_hidden(obj))
+  if (obj->is_internal())
     return;
   for (auto &c : this->active_clients()) {
     if (c->flags_.state_subscription)
@@ -503,7 +489,7 @@ void APIServer::on_event(event::Event *obj) {
 #ifdef USE_UPDATE
 // Update is a special case - the method is called on_update, not on_update_update
 void APIServer::on_update(update::UpdateEntity *obj) {
-  if (obj->is_internal() || this->is_hidden(obj))
+  if (obj->is_internal())
     return;
   for (auto &c : this->active_clients()) {
     if (c->flags_.state_subscription)
@@ -569,14 +555,6 @@ void APIServer::send_homeassistant_action(const HomeassistantActionRequest &call
              this->is_connected() ? LOG_STR_LITERAL("client has not subscribed to actions (yet)")
                                   : LOG_STR_LITERAL("no client connected"));
   }
-}
-
-bool APIServer::has_homeassistant_action_subscriber() const {
-  for (uint8_t i = 0; i < this->api_connection_count_; i++) {
-    if (this->clients_[i]->flags_.service_call_subscription)
-      return true;
-  }
-  return false;
 }
 #ifdef USE_API_HOMEASSISTANT_ACTION_RESPONSES
 void APIServer::register_action_response_callback(uint32_t call_id, ActionResponseCallback callback) {
@@ -813,8 +791,6 @@ void APIServer::on_log(uint8_t level, const char *tag, const char *message, size
     return;
   }
   for (auto &c : this->active_clients()) {
-    if (this->log_target_ != nullptr && &*c != this->log_target_)
-      continue;
     if (!c->flags_.remove && c->get_log_subscription_level() >= level)
       c->try_send_log_message(level, tag, message, message_len);
   }
@@ -850,14 +826,6 @@ void APIServer::on_shutdown() {
       // schedule it at the front of the batch so it will be sent with priority
       c->schedule_message_front_(nullptr, DisconnectRequest::MESSAGE_TYPE, DisconnectRequest::ESTIMATED_SIZE);
     }
-  }
-}
-
-void APIServer::relist_clients() {
-  for (auto &c : this->active_clients()) {
-    DisconnectRequest req;
-    if (!c->send_message(req))
-      c->schedule_message_front_(nullptr, DisconnectRequest::MESSAGE_TYPE, DisconnectRequest::ESTIMATED_SIZE);
   }
 }
 
@@ -950,19 +918,6 @@ void APIServer::send_action_response(uint32_t action_call_id, bool success, Stri
 }
 #endif  // USE_API_USER_DEFINED_ACTION_RESPONSES_JSON
 #endif  // USE_API_USER_DEFINED_ACTION_RESPONSES
-
-#ifdef USE_API_USER_DEFINED_ACTIONS
-void APIServer::unregister_user_service_(void *server, void *descriptor, void *unused) {
-  auto &services = static_cast<APIServer *>(server)->user_services_;
-  for (auto it = services.begin(); it != services.end(); ++it) {
-    if (*it == descriptor) {
-      services.erase(it);
-      App.notify_entities_changed();
-      return;
-    }
-  }
-}
-#endif
 
 }  // namespace esphome::api
 #endif

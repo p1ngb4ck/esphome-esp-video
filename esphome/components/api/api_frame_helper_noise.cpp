@@ -4,7 +4,6 @@
 #include "api_connection.h"  // For ClientInfo struct
 #include "esphome/components/noise/noise.h"
 #include "esphome/core/application.h"
-#include "esphome/components/network/util.h"
 #include "esphome/core/entity_base.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/helpers.h"
@@ -295,7 +294,7 @@ APIError APINoiseFrameHelper::state_action_client_hello_() {
   return APIError::OK;
 }
 APIError APINoiseFrameHelper::send_server_hello_frame_() {
-  const StringRef name = network::device_name();
+  const auto &name = App.get_name();
   char mac[MAC_ADDRESS_BUFFER_SIZE];
   get_mac_address_into_buffer(mac);
 

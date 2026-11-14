@@ -80,11 +80,7 @@ class JpegDecoder : public ImageDecoder {
   // Hardware/SIMD backends decode into one contiguous RGB888 buffer; this
   // walks it pixel-by-pixel into the RuntimeImage via draw().
   void draw_rgb888_buffer_(const uint8_t *rgb, uint32_t width, uint32_t height);
-#endif
-#if defined(USE_HWJPG)
-  int decode_rgb565_(jpeg_decoder_handle_t decoder, uint8_t *buffer, size_t size,
-                     const jpeg_decode_picture_info_t &info);
-#elif !defined(USE_NEWJPEG)
+#else
   /// Set up an opened image for decoding. Returns 0, or a DecodeError.
   int start_();
   /// The JPEGDEC option for scale_: JPEG_SCALE_HALF, _QUARTER and _EIGHTH are the divisors themselves

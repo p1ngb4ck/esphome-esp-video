@@ -1,12 +1,11 @@
 from esphome.components.key_provider import KeyProvider
 import esphome.config_validation as cv
 from esphome.const import CONF_ITEMS, CONF_MODE
-from esphome.core import CORE
 from esphome.cpp_types import std_string
 
 from ..defines import CONF_MAIN, KEYBOARD_MODES, get_widget_map, literal
 from ..types import LvCompound, LvType
-from . import Widget, WidgetType, get_widgets, widget_unit
+from . import Widget, WidgetType, get_widgets
 from .buttonmatrix import CONF_BUTTONMATRIX
 from .label import CONF_LABEL
 from .textarea import CONF_TEXTAREA, lv_textarea_t
@@ -28,9 +27,7 @@ lv_keyboard_t = LvType(
     parents=(KeyProvider, LvCompound),
     largs=[(std_string, "text")],
     has_on_value=True,
-    lvalue=lambda w: literal(
-        f"(lv_keyboard_get_textarea({w.obj}) != nullptr ? lv_textarea_get_text(lv_keyboard_get_textarea({w.obj})) : \"\")"
-    ),
+    lvalue=lambda w: literal(f"lv_textarea_get_text({w.obj})"),
 )
 
 
@@ -68,10 +65,9 @@ class KeyboardType(WidgetType):
 async def attach_textareas():
     for w in get_widget_map().values():
         if w.type == keyboard_spec and w.config.get(CONF_TEXTAREA):
-            with CORE.codegen_unit(widget_unit(w)):
-                await w.set_property(
-                    CONF_TEXTAREA, (await get_widgets(w.config, CONF_TEXTAREA))[0].obj
-                )
+            await w.set_property(
+                CONF_TEXTAREA, (await get_widgets(w.config, CONF_TEXTAREA))[0].obj
+            )
 
 
 keyboard_spec = KeyboardType()

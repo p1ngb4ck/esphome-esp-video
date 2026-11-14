@@ -65,6 +65,6 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_frame_size(config[CONF_FRAME_SIZE]))
     latency = config[CONF_AUDIO_LATENCY]
     if isinstance(latency, cv.Lambda):
-        cg.add(var.set_audio_latency_lambda(await cg.process_lambda(latency, [], return_type=cg.int32)))
+        cg.add(var.set_audio_latency_lambda(await cg.process_lambda(latency, [], return_type=cg.uint32)))
     else:
         cg.add(var.set_audio_latency(latency.total_milliseconds))
