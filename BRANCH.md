@@ -6,5 +6,4 @@ Change of this branch: stream_receiver: media_player platform for a stream from 
 
 Based on these branches, whose changes it holds and builds on:
 
-- `pr/avi`: avi: AVI demuxer, muxer, read-ahead file reader on the storage worker
-- `pr/display-video-output`: display, lvgl: `display::VideoOutput` - JPEG frames straight into the scanout, LVGL `video_output:` (1-2 canvases), page mode, the camera scanout layer, frame capture
+- `pr/avi-media-player`: avi: media_player platform (MJPEG through the video output, PCM / MP3 / FLAC sound, playlist, network streams)
