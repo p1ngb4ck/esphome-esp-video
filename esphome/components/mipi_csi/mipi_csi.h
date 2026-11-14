@@ -180,10 +180,7 @@ class MipiCsiCamera final : public camera::Camera {
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::LATE; }
 
-  void add_listener(camera::CameraListener *listener) override {
-    this->listeners_.push_back(listener);
-    camera::note_listener(this->listeners_, listener);
-  }
+  void add_listener(camera::CameraListener *listener) override { this->listeners_.push_back(listener); }
   camera::CameraImageReader *create_image_reader() override { return new MipiCsiImageReader(this); }  // NOLINT
   void request_image(camera::CameraRequester requester) override;
   void start_stream(camera::CameraRequester requester) override;

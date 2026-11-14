@@ -269,15 +269,6 @@ class LvglComponent final : public PollingComponent {
   static void render_start_cb(lv_event_t *event);
   void dump_config() override;
   lv_display_t *get_disp() { return this->disp_; }
-  void for_each_group_object(lv_group_t *group, void (*callback)(lv_obj_t *));
-#ifdef USE_LVGL_CONFIG_CACHE
-  static uint32_t config_fingerprint(uint32_t seed, const void *data, size_t len);
-  size_t config_state_size();
-  void config_state_save(uint8_t *out, size_t size, uint32_t fingerprint);
-  bool config_state_load(const uint8_t *data, size_t size, uint32_t fingerprint);
-  void config_state_generate();
-  bool config_held_{true};
-#endif
   lv_obj_t *get_screen_active() { return lv_display_get_screen_active(this->disp_); }
   // Pause or resume the display.
   // @param paused If true, pause the display. If false, resume the display.
@@ -294,7 +285,6 @@ class LvglComponent final : public PollingComponent {
 #ifdef USE_LVGL_HID
   // Keypads whose keys still run their actions while the display is paused.
   void add_hid_keypad(LVHIDKeypadListener *keypad) { this->hid_keypads_.push_back(keypad); }
-  void remove_hid_keypad(LVHIDKeypadListener *keypad) { std::erase(this->hid_keypads_, keypad); }
   /// Takes keys, typed characters and pointer motion while the display is paused, for what shows on
   /// it instead. Keys and characters come from the main loop, pointer motion from wherever its source
   /// reports it. Each returns whether it was taken: navigation keys taken run no action here.
@@ -374,7 +364,6 @@ class LvglComponent final : public PollingComponent {
 #endif
 
   void add_page(LvPageType *page);
-  void remove_page(LvPageType *page);
   void show_page(size_t index, lv_screen_load_anim_t anim, uint32_t time);
   void show_next_page(lv_screen_load_anim_t anim, uint32_t time);
   void show_prev_page(lv_screen_load_anim_t anim, uint32_t time);
@@ -393,9 +382,6 @@ class LvglComponent final : public PollingComponent {
 
   void set_pause_trigger(Trigger<> *trigger) { this->pause_callback_ = trigger; }
   void set_resume_trigger(Trigger<> *trigger) { this->resume_callback_ = trigger; }
-  template<typename F> void add_on_resume_callback(F &&callback) {
-    this->resume_callbacks_.add(std::forward<F>(callback));
-  }
   void set_draw_start_trigger(Trigger<> *trigger) { this->draw_start_callback_ = trigger; }
   void set_draw_end_trigger(Trigger<> *trigger) { this->draw_end_callback_ = trigger; }
   void set_landscape_trigger(Trigger<> *trigger) { this->landscape_callback_ = trigger; }
@@ -546,7 +532,6 @@ class LvglComponent final : public PollingComponent {
   bool draw_end_event_registered_{false};
   Trigger<> *pause_callback_{};
   Trigger<> *resume_callback_{};
-  CallbackManager<void()> resume_callbacks_{};
   Trigger<> *draw_start_callback_{};
   Trigger<> *draw_end_callback_{};
   Trigger<> *landscape_callback_{};
@@ -593,20 +578,12 @@ class LvglComponent final : public PollingComponent {
   uint32_t cam_frames_{0};      // pictures presented since cam_rate_since_ (the log's rate line)
   uint32_t cam_rate_since_{0};
   enum VideoCanvasState : uint8_t { VC_IDLE, VC_WANT, VC_GRANTED, VC_REFUSED, VC_DONE, VC_DONE_NEXT };
-  bool vc_shown_now_(lv_area_t *rows, lv_area_t *over) const;
-  void vc_overlay_set_(const lv_area_t *over);
-  void vc_overlay_draw_(const lv_area_t *area, const uint8_t *src);
-  void vc_overlay_apply_();
+  bool vc_shown_now_(lv_area_t *rows) const;
   void vc_service_();
   void vc_drop_();
   uint8_t vc_outside_(const lv_area_t *area, lv_area_t *parts) const;
   lv_obj_t *vc_marker_{nullptr};
   lv_area_t vc_rows_{0, 0, -1, -1};
-  lv_area_t vc_over_{0, 0, -1, -1};
-  uint8_t *vc_over_buf_{nullptr};
-  int32_t vc_over_y_{0};
-  int32_t vc_over_h_{0};
-  bool vc_over_ready_{false};
   VideoCanvasTarget vc_target_{};
   TaskHandle_t vc_waiter_{nullptr};
   uint32_t vc_layout_{0};

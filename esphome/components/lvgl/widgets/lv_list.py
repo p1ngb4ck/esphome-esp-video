@@ -14,7 +14,6 @@ from esphome.const import (
     CONF_TEXT,
     CONF_TRIGGER_ID,
 )
-from esphome.core import CORE
 from esphome.cpp_generator import MockObj
 from esphome.schema_extractors import SCHEMA_EXTRACT, schema_extractor
 
@@ -32,7 +31,6 @@ from ..defines import (
     add_lv_use,
     get_list_triggers,
     literal,
-    get_widget_map,
 )
 from ..lv_validation import lv_int, lv_text, padding
 from ..lvcode import (
@@ -56,7 +54,6 @@ from ..schemas import (
 from ..trigger import add_trigger
 from ..types import LV_EVENT, LvType, ObjUpdateAction, lv_obj_t
 from . import (
-    widget_unit,
     Widget,
     WidgetType,
     apply_debug_outline,
@@ -103,15 +100,13 @@ async def finish_list_triggers() -> None:
     instead of being built there directly.
     """
     # Avoid circular references by creating the trigger Pvariables first
-    built_triggers = []
-    for list_id, triggers in get_list_triggers().items():
-        unit = widget_unit(get_widget_map().get(list_id))
-        for conf in triggers.on_add + triggers.on_remove:
-            with CORE.codegen_unit(unit):
-                built_triggers.append((cg.new_Pvariable(conf[CONF_TRIGGER_ID]), conf, unit))
-    for trigger, conf, unit in built_triggers:
-        with CORE.codegen_unit(unit):
-            await automation.build_automation(trigger, [(cg.int_, "list_index")], conf)
+    built_triggers = [
+        (cg.new_Pvariable(conf[CONF_TRIGGER_ID]), conf)
+        for triggers in get_list_triggers().values()
+        for conf in triggers.on_add + triggers.on_remove
+    ]
+    for trigger, conf in built_triggers:
+        await automation.build_automation(trigger, [(cg.int_, "list_index")], conf)
 
 
 async def _fire_index_triggers(confs: list, index) -> None:
