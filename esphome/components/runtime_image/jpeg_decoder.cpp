@@ -13,7 +13,11 @@
 #endif
 
 #if defined(USE_HWJPG)
+#include "driver/ppa.h"
+#include "esp_cache.h"
 #include "esp_heap_caps.h"
+#include <algorithm>
+#include <cstring>
 #endif
 
 ESPHOME_LOG_TAG(TAG, "image_decoder.jpeg");
@@ -56,6 +60,15 @@ template<> int JpegDecoder::decode_backend_<JpegBackend::HW_P4>(uint8_t *buffer,
     return DECODE_ERROR_INTERNAL_DECODER_ERROR;
   }
 
+  const int direct = this->decode_rgb565_(decoder, buffer, size, info);
+  if (direct != 0) {
+    jpeg_del_decoder_engine(decoder);
+    if (direct < 0)
+      return direct;
+    this->decoded_bytes_ = size;
+    return size;
+  }
+
   jpeg_decode_memory_alloc_cfg_t out_alloc_cfg{};
   out_alloc_cfg.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER;
   size_t out_capacity = 0;
@@ -86,6 +99,93 @@ template<> int JpegDecoder::decode_backend_<JpegBackend::HW_P4>(uint8_t *buffer,
   heap_caps_free(outbuf);
   this->decoded_bytes_ = size;
   return size;
+}
+
+int JpegDecoder::decode_rgb565_(jpeg_decoder_handle_t decoder, uint8_t *buffer, size_t size,
+                                const jpeg_decode_picture_info_t &info) {
+  uint8_t *target = this->image_buffer_();
+  const int bw = this->image_->get_buffer_width();
+  const int bh = this->image_->get_buffer_height();
+  if (!this->uses_direct_rgb565() || target == nullptr || bw <= 0 || bh <= 0 || this->image_->has_external_buffer() ||
+      (reinterpret_cast<uintptr_t>(target) & (RuntimeImage::BUFFER_ALIGN - 1)) != 0)
+    return 0;
+  float scale = std::min(static_cast<float>(bw) / static_cast<float>(info.width),
+                         static_cast<float>(bh) / static_cast<float>(info.height));
+  scale = std::min(scale, 15.0f);
+  const uint32_t steps = static_cast<uint32_t>(scale * 16.0f);
+  if (steps == 0)
+    return 0;
+  const uint32_t ow = info.width * (steps / 16) + info.width * (steps % 16) / 16;
+  const uint32_t oh = info.height * (steps / 16) + info.height * (steps % 16) / 16;
+  if (ow == 0 || oh == 0 || ow > static_cast<uint32_t>(bw) || oh > static_cast<uint32_t>(bh))
+    return 0;
+
+  const bool wide = info.sample_method == JPEG_DOWN_SAMPLING_YUV422 || info.sample_method == JPEG_DOWN_SAMPLING_YUV420;
+  const uint32_t pw = (info.width + (wide ? 15 : 7)) & ~(wide ? 15u : 7u);
+  const uint32_t ph = (info.height + (info.sample_method == JPEG_DOWN_SAMPLING_YUV420 ? 15 : 7)) &
+                      ~(info.sample_method == JPEG_DOWN_SAMPLING_YUV420 ? 15u : 7u);
+  jpeg_decode_memory_alloc_cfg_t alloc_cfg{};
+  alloc_cfg.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER;
+  size_t scratch_capacity = 0;
+  auto *scratch = static_cast<uint8_t *>(
+      jpeg_alloc_decoder_mem(static_cast<size_t>(pw) * ph * 2, &alloc_cfg, &scratch_capacity));
+  if (scratch == nullptr) {
+    ESP_LOGE(TAG, "Could not allocate JPEG output buffer");
+    return DECODE_ERROR_OUT_OF_MEMORY;
+  }
+  jpeg_decode_cfg_t decode_cfg{};
+  decode_cfg.output_format = JPEG_DECODE_OUT_FORMAT_RGB565;
+  decode_cfg.rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR;
+  decode_cfg.conv_std = JPEG_YUV_RGB_CONV_STD_BT601;
+  uint32_t out_size = 0;
+  esp_err_t err = jpeg_decoder_process(decoder, &decode_cfg, buffer, static_cast<uint32_t>(size), scratch,
+                                       static_cast<uint32_t>(scratch_capacity), &out_size);
+  if (err != ESP_OK || out_size == 0) {
+    ESP_LOGE(TAG, "Hardware JPEG decode failed: %d", err);
+    heap_caps_free(scratch);
+    return DECODE_ERROR_INTERNAL_DECODER_ERROR;
+  }
+
+  ppa_client_config_t client_cfg{};
+  client_cfg.oper_type = PPA_OPERATION_SRM;
+  client_cfg.max_pending_trans_num = 1;
+  ppa_client_handle_t ppa = nullptr;
+  if (ppa_register_client(&client_cfg, &ppa) != ESP_OK) {
+    ESP_LOGE(TAG, "Could not register a PPA client");
+    heap_caps_free(scratch);
+    return DECODE_ERROR_INTERNAL_DECODER_ERROR;
+  }
+  const size_t capacity = this->image_->buffer_capacity(bw, bh);
+  if (ow != static_cast<uint32_t>(bw) || oh != static_cast<uint32_t>(bh))
+    memset(target, 0, capacity);
+  esp_cache_msync(target, capacity, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+  ppa_srm_oper_config_t op{};
+  op.in.buffer = scratch;
+  op.in.pic_w = pw;
+  op.in.pic_h = ph;
+  op.in.block_w = info.width;
+  op.in.block_h = info.height;
+  op.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  op.out.buffer = target;
+  op.out.buffer_size = capacity;
+  op.out.pic_w = static_cast<uint32_t>(bw);
+  op.out.pic_h = static_cast<uint32_t>(bh);
+  op.out.block_offset_x = (static_cast<uint32_t>(bw) - ow) / 2;
+  op.out.block_offset_y = (static_cast<uint32_t>(bh) - oh) / 2;
+  op.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  op.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
+  op.scale_x = static_cast<float>(steps) / 16.0f;
+  op.scale_y = static_cast<float>(steps) / 16.0f;
+  op.byte_swap = this->image_is_big_endian_();
+  op.mode = PPA_TRANS_MODE_BLOCKING;
+  err = ppa_do_scale_rotate_mirror(ppa, &op);
+  ppa_unregister_client(ppa);
+  heap_caps_free(scratch);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "PPA scaling failed: %d", err);
+    return DECODE_ERROR_INTERNAL_DECODER_ERROR;
+  }
+  return 1;
 }
 
 #elif defined(USE_NEWJPEG)
