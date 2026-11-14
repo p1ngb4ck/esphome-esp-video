@@ -8,6 +8,10 @@
 #include "esphome/core/component.h"
 #include "esphome/core/preferences.h"
 
+#if defined(USE_LVGL_KEY_BINDINGS_FILE) && defined(USE_STORAGE_WORKER)
+#include "esphome/components/storage/storage_worker.h"
+#endif
+
 #include <lvgl.h>
 
 #include <string>
@@ -160,6 +164,18 @@ class KeyBindings : public Component {
   uint32_t last_attempt_{0};
   bool loaded_{false};
   bool dirty_{false};
+#if defined(USE_LVGL_KEY_BINDINGS_FILE) && defined(USE_STORAGE_WORKER)
+  void file_read_next_();
+  void file_read_end_(bool ok);
+  void file_free_();
+  storage::FileStat file_stat_{};
+  storage::StreamHandle file_stream_{};
+  uint8_t *file_buf_{nullptr};
+  size_t file_len_{0};
+  size_t file_got_{0};
+  size_t file_step_{0};
+  bool file_busy_{false};
+#endif
 };
 
 template<typename... Ts> class KeyBindingsLearnAction : public Action<Ts...>, public Parented<KeyBindings> {
