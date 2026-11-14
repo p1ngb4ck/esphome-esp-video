@@ -9,7 +9,6 @@ from esphome.const import (
     CONF_X,
     CONF_Y,
 )
-from esphome.core import CORE, ID
 from esphome.cpp_generator import MockObj, new_Pvariable
 from esphome.cpp_helpers import register_component
 from esphome.cpp_types import nullptr
@@ -43,7 +42,7 @@ from .lvcode import (
     lvgl_static,
 )
 from .types import LV_EVENT, lv_point_t
-from .widgets import LvScrActType, get_screen_active, widget_unit
+from .widgets import LvScrActType, get_screen_active
 
 
 async def add_on_boot_triggers(triggers):
@@ -66,52 +65,47 @@ async def generate_triggers():
     # buttonmatrix's or tabview's to_code registers its own child widgets), which
     # would otherwise mutate this dict mid-iteration.
     for w in list(get_widget_map().values()):
-        with CORE.codegen_unit(widget_unit(w)):
-            await _widget_triggers(w, all_triggers)
+        config = w.config
+        if isinstance(w.type, LvScrActType):
+            w = get_screen_active(w.var)
 
+        if config:
+            for event, conf in {
+                event: conf for event, conf in config.items() if event in all_triggers
+            }.items():
+                conf = conf[0]
+                w.set_flag(CONF_CLICKABLE, True)
+                await add_trigger(conf, w, event)
 
-async def _widget_triggers(w, all_triggers):
-    config = w.config
-    if isinstance(w.type, LvScrActType):
-        w = get_screen_active(w.var)
+            for event, conf in {
+                event: conf for event, conf in config.items() if event in SWIPE_TRIGGERS
+            }.items():
+                conf = conf[0]
+                dir = event[9:].upper()
+                dir = {"UP": "TOP", "DOWN": "BOTTOM"}.get(dir, dir)
+                dir = DIRECTIONS.mapper(dir)
+                w.set_flag(CONF_SCROLLABLE, False)
+                selected = literal(
+                    f"lv_indev_get_gesture_dir(lv_indev_active()) == {dir}"
+                )
+                await add_trigger(conf, w, "GESTURE", is_selected=selected)
 
-    if config:
-        for event, conf in {
-            event: conf for event, conf in config.items() if event in all_triggers
-        }.items():
-            conf = conf[0]
-            w.set_flag(CONF_CLICKABLE, True)
-            await add_trigger(conf, w, event)
+            for conf in config.get(CONF_ON_VALUE, ()):
+                await add_trigger(
+                    conf,
+                    w,
+                    LV_EVENT.VALUE_CHANGED,
+                    UPDATE_EVENT,
+                )
 
-        for event, conf in {
-            event: conf for event, conf in config.items() if event in SWIPE_TRIGGERS
-        }.items():
-            conf = conf[0]
-            dir = event[9:].upper()
-            dir = {"UP": "TOP", "DOWN": "BOTTOM"}.get(dir, dir)
-            dir = DIRECTIONS.mapper(dir)
-            w.set_flag(CONF_SCROLLABLE, False)
-            selected = literal(
-                f"lv_indev_get_gesture_dir(lv_indev_active()) == {dir}"
-            )
-            await add_trigger(conf, w, "GESTURE", is_selected=selected)
+            for conf in config.get(CONF_ON_UPDATE, ()):
+                await add_trigger(
+                    conf,
+                    w,
+                    UPDATE_EVENT,
+                )
 
-        for conf in config.get(CONF_ON_VALUE, ()):
-            await add_trigger(
-                conf,
-                w,
-                LV_EVENT.VALUE_CHANGED,
-                UPDATE_EVENT,
-            )
-
-        for conf in config.get(CONF_ON_UPDATE, ()):
-            await add_trigger(
-                conf,
-                w,
-                UPDATE_EVENT,
-            )
-
-        await add_on_boot_triggers(config.get(CONF_ON_BOOT, ()))
+            await add_on_boot_triggers(config.get(CONF_ON_BOOT, ()))
 
 
 async def generate_align_tos(config: dict):
@@ -126,23 +120,17 @@ async def generate_align_tos(config: dict):
     align_tos = tuple(
         w for w in widget_map.values() if w.config and CONF_ALIGN_TO in w.config
     )
-    groups: dict = {}
-    for w in align_tos:
-        groups.setdefault(widget_unit(w), []).append(w)
-    for index, (unit, group) in enumerate(groups.items()):
-        with CORE.codegen_unit(unit):
-            async with LambdaContext(where="align_to") as context:
-                for w in group:
-                    align_to = w.config[CONF_ALIGN_TO]
-                    target = widget_map[align_to[CONF_ID]].obj
-                    align = literal(align_to[CONF_ALIGN])
-                    x = align_to[CONF_X]
-                    y = align_to[CONF_Y]
-                    lv.obj_align_to(w.obj, target, align, x, y)
+    if align_tos:
+        async with LambdaContext(where="align_to") as context:
+            for w in align_tos:
+                align_to = w.config[CONF_ALIGN_TO]
+                target = widget_map[align_to[CONF_ID]].obj
+                align = literal(align_to[CONF_ALIGN])
+                x = align_to[CONF_X]
+                y = align_to[CONF_Y]
+                lv.obj_align_to(w.obj, target, align, x, y)
 
             action_id = config[CONF_ALIGN_TO_LAMBDA_ID]
-            if index:
-                action_id = ID(f"{action_id.id}_{index}", is_declaration=True, type=action_id.type)
             var = new_Pvariable(action_id, await context.get_lambda())
             await register_component(var, {})
 
