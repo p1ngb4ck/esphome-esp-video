@@ -7,7 +7,4 @@ Change of this branch: avi: media_player platform (MJPEG through the video outpu
 Based on these branches, whose changes it holds and builds on:
 
 - `pr/avi`: avi: AVI demuxer, muxer, read-ahead file reader on the storage worker
-- `pr/esp32-require-hw-jpeg`: esp32 `require_hw_jpeg()`: the JPEG codec for the chip (P4 hardware JPEG, S2 / S3 esp_new_jpeg, others JPEGDEC)
-- `pr/lvgl-remote-input` of p1ngb4ck/esphome-hid: `lvgl` `remote_input`: LVGL from outside (pointer, keys by key binding action, text), keys fire their action while LVGL is paused
-- `pr/lvgl-color-depth-32` of p1ngb4ck/esphome-mipi-display: lvgl `color_depth: 32` as RGB888 (3 bytes per pixel)
-- `pr/mipi-dsi-scanout` of p1ngb4ck/esphome-mipi-display: mipi_dsi `frame_buffers` (up to 3), the frame buffers handed to a direct client and flipped at the frame end, the scanout interface, LVGL drawing straight into the frame buffers with two of them
+- `pr/display-video-output`: display, lvgl: `display::VideoOutput` - JPEG frames straight into the scanout, LVGL `video_output:` (1-2 canvases), page mode, the camera scanout layer, frame capture
