@@ -120,10 +120,10 @@ Each `pr/` branch holds one part of this topic on top of upstream and says in it
 | `pr/camera-encoder-option` | `pr/esp32-require-h264-encoder`, `pr/mipi-csi-hw-jpeg` |
 | `pr/display-video-output` | `pr/esp32-require-hw-jpeg`, `pr/lvgl-remote-input` of p1ngb4ck/esphome-hid, `pr/lvgl-color-depth-32` of p1ngb4ck/esphome-mipi-display, `pr/mipi-dsi-scanout` of p1ngb4ck/esphome-mipi-display |
 | `pr/display-video-output-page-draw` | `pr/display-video-output` |
-| `pr/display-video-output-rows` | `pr/esp32-require-hw-jpeg`, `pr/hid` of p1ngb4ck/esphome-hid, `pr/i2c-bus-recovery-option` of p1ngb4ck/esphome-mipi-display |
+| `pr/display-video-output-rows` | `pr/display-video-output-page-draw` |
 | `pr/esp32-require-h264-encoder` | `pr/camera-encoder-h264`, `pr/esp32-require-hw-jpeg` |
 | `pr/esp32-require-hw-jpeg` | upstream only |
-| `pr/media-player-options` | `pr/display-video-output-page-draw`, `pr/display-video-output-rows`, `pr/online-image-path-source`, `pr/relay-link` of p1ngb4ck/esphome-relay-link |
+| `pr/media-player-options` | `pr/display-video-output-rows`, `pr/online-image-path-source`, `pr/relay-link` of p1ngb4ck/esphome-relay-link |
 | `pr/mipi-csi` | upstream only |
 | `pr/mipi-csi-controls` | `pr/mipi-csi-esp-ipa` |
 | `pr/mipi-csi-define` | `pr/mipi-csi-ov02c10` |
