@@ -13,7 +13,6 @@ from esphome.const import (
     CONF_TYPE,
     CONF_WEIGHT,
 )
-from esphome.core import CORE
 from esphome.cpp_generator import MockObj, TemplateArguments
 
 from ..const import CONF_LOOP, CONF_ON_STOP
@@ -36,7 +35,7 @@ from .lv_validation import (
 from .lvcode import LVGL_COMP_ARG, LambdaContext, LvglComponent, lv_add
 from .schemas import STYLE_PROPS
 from .types import LvAnimation, LvglAction, lv_color_t, lv_coord_t, lv_obj_t, lvgl_ns
-from .widgets import get_widgets, lvgl_unit
+from .widgets import get_widgets
 
 LvAnimationTimingRoundTrip = lvgl_ns.class_("LvAnimationTimingRoundTrip")
 LvAnimationTimingEaseInOut = lvgl_ns.class_("LvAnimationTimingEaseInOut")
@@ -250,9 +249,8 @@ async def add_animation_triggers(config):
 
     for animation in config:
         var = await cg.get_variable(animation[CONF_ID])
-        with CORE.codegen_unit(lvgl_unit(animation)):
-            await add_triggers(var, CONF_ON_START, animation.get(CONF_ON_START, []))
-            await add_triggers(var, CONF_ON_STOP, animation.get(CONF_ON_STOP, []))
+        await add_triggers(var, CONF_ON_START, animation.get(CONF_ON_START, []))
+        await add_triggers(var, CONF_ON_STOP, animation.get(CONF_ON_STOP, []))
 
 
 @automation.register_action(
