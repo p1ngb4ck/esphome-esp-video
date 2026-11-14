@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esphome/components/image/image.h"
+#include "esphome/core/defines.h"
 #include "esphome/core/helpers.h"
 
 #include <vector>
@@ -191,6 +192,13 @@ class RuntimeImage : public image::Image {
    * Returns 0 for dimensions the image cannot decode at.
    */
   size_t get_buffer_size(int width, int height) const;
+#ifdef USE_HWJPG
+  static constexpr size_t BUFFER_ALIGN = 128;
+  size_t buffer_capacity(int width, int height) const {
+    return (this->get_buffer_size(width, height) + BUFFER_ALIGN - 1) & ~(BUFFER_ALIGN - 1);
+  }
+  bool has_external_buffer() const { return this->external_buffer_; }
+#endif
 
   /**
    * @brief Set whether to allow progressive display during decode.

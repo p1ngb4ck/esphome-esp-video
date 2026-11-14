@@ -563,6 +563,7 @@ def _add_idf_config(config: ConfigType) -> None:
         # is already off unless an SPI sensor selects it, so it needs no entry here.
         "CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE": True,
         "CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE": False,
+        "CONFIG_CAM_CTLR_SPI_ISR_CACHE_SAFE": False,
         # The ISP debayers RAW sensors. Its pipeline controller is what runs the IPA algorithms
         # (auto exposure, auto white balance, denoise) and is off by default.
         "CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE": True,

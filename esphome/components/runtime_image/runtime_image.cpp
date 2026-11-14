@@ -8,6 +8,9 @@
 #include <cstring>
 #include <limits>
 
+#ifdef USE_HWJPG
+#include "esp_heap_caps.h"
+#endif
 #ifdef USE_RUNTIME_IMAGE_BMP
 #include "bmp_decoder.h"
 #endif
@@ -450,6 +453,15 @@ size_t RuntimeImage::resize_buffer_(int width, int height) {
   }
 
   ESP_LOGD(TAG, "Allocating buffer: %dx%d, %zu bytes", width, height, new_size);
+#ifdef USE_HWJPG
+  this->buffer_ = static_cast<uint8_t *>(heap_caps_aligned_calloc(
+      BUFFER_ALIGN, 1, this->buffer_capacity(width, height), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!this->buffer_) {
+    ESP_LOGE(TAG, "Failed to allocate %zu bytes. Largest free block: %zu", this->buffer_capacity(width, height),
+             heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    return 0;
+  }
+#else
   RAMAllocator<uint8_t> allocator;
   this->buffer_ = allocator.allocate(new_size);
 
@@ -461,6 +473,7 @@ size_t RuntimeImage::resize_buffer_(int width, int height) {
 
   // Clear buffer
   memset(this->buffer_, 0, new_size);
+#endif
 
   this->buffer_width_ = width;
   this->buffer_height_ = height;

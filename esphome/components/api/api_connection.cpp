@@ -32,6 +32,10 @@
 #include "esphome/core/log.h"
 #include "esphome/core/progmem.h"
 #include "esphome/core/version.h"
+
+#ifdef USE_STORE_YAML
+#include "store_yaml_size.h"
+#endif
 #ifdef USE_PROVISIONING
 #include "esphome/components/provisioning/provisioning.h"
 #endif
@@ -185,12 +189,14 @@ void APIConnection::start() {
 APIConnection::~APIConnection() {
   this->destroy_active_iterator_();
 #ifdef USE_BLUETOOTH_PROXY
-  if (bluetooth_proxy::global_bluetooth_proxy->get_api_connection() == this) {
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr &&
+      bluetooth_proxy::global_bluetooth_proxy->get_api_connection() == this) {
     bluetooth_proxy::global_bluetooth_proxy->unsubscribe_api_connection(this);
   }
 #endif
 #ifdef USE_VOICE_ASSISTANT
-  if (voice_assistant::global_voice_assistant->get_api_connection() == this) {
+  if (voice_assistant::global_voice_assistant != nullptr &&
+      voice_assistant::global_voice_assistant->get_api_connection() == this) {
     voice_assistant::global_voice_assistant->client_subscription(this, false);
   }
 #endif
@@ -467,7 +473,9 @@ void APIConnection::on_subscribe_logs_request(const SubscribeLogsRequest &msg) {
   if (msg.dump_config)
     App.schedule_dump_config();
 #if defined(USE_LOGGER) && defined(USE_CRASH_HANDLER)
+  this->parent_->set_log_target(this);
   logger::log_crash_to_client();
+  this->parent_->set_log_target(nullptr);
 #endif
 }
 
@@ -1298,37 +1306,47 @@ void APIConnection::on_get_time_response(const GetTimeResponse &value) {
 #ifdef USE_BLUETOOTH_PROXY
 void APIConnection::on_subscribe_bluetooth_le_advertisements_request(
     const SubscribeBluetoothLEAdvertisementsRequest &msg) {
-  bluetooth_proxy::global_bluetooth_proxy->subscribe_api_connection(this, msg.flags);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr)
+    bluetooth_proxy::global_bluetooth_proxy->subscribe_api_connection(this, msg.flags);
 }
 void APIConnection::on_unsubscribe_bluetooth_le_advertisements_request() {
-  bluetooth_proxy::global_bluetooth_proxy->unsubscribe_api_connection(this);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr)
+    bluetooth_proxy::global_bluetooth_proxy->unsubscribe_api_connection(this);
 }
 #ifdef USE_BLUETOOTH_PROXY_CONNECTIONS
 void APIConnection::on_bluetooth_device_request(const BluetoothDeviceRequest &msg) {
-  bluetooth_proxy::global_bluetooth_proxy->bluetooth_device_request(msg);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr)
+    bluetooth_proxy::global_bluetooth_proxy->bluetooth_device_request(msg);
 }
 void APIConnection::on_bluetooth_gatt_read_request(const BluetoothGATTReadRequest &msg) {
-  bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_read(msg);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr)
+    bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_read(msg);
 }
 void APIConnection::on_bluetooth_gatt_write_request(const BluetoothGATTWriteRequest &msg) {
-  bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_write(msg);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr)
+    bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_write(msg);
 }
 void APIConnection::on_bluetooth_gatt_read_descriptor_request(const BluetoothGATTReadDescriptorRequest &msg) {
-  bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_read_descriptor(msg);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr)
+    bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_read_descriptor(msg);
 }
 void APIConnection::on_bluetooth_gatt_write_descriptor_request(const BluetoothGATTWriteDescriptorRequest &msg) {
-  bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_write_descriptor(msg);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr)
+    bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_write_descriptor(msg);
 }
 void APIConnection::on_bluetooth_gatt_get_services_request(const BluetoothGATTGetServicesRequest &msg) {
-  bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_send_services(msg);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr)
+    bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_send_services(msg);
 }
 
 void APIConnection::on_bluetooth_gatt_notify_request(const BluetoothGATTNotifyRequest &msg) {
-  bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_notify(msg);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr)
+    bluetooth_proxy::global_bluetooth_proxy->bluetooth_gatt_notify(msg);
 }
 
 bool APIConnection::send_subscribe_bluetooth_connections_free_response_() {
-  bluetooth_proxy::global_bluetooth_proxy->send_connections_free(this);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr)
+    bluetooth_proxy::global_bluetooth_proxy->send_connections_free(this);
   return true;
 }
 void APIConnection::on_subscribe_bluetooth_connections_free_request() {
@@ -1338,13 +1356,16 @@ void APIConnection::on_subscribe_bluetooth_connections_free_request() {
 }
 
 void APIConnection::on_bluetooth_set_connection_params_request(const BluetoothSetConnectionParamsRequest &msg) {
-  bluetooth_proxy::global_bluetooth_proxy->bluetooth_set_connection_params(msg);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr)
+    bluetooth_proxy::global_bluetooth_proxy->bluetooth_set_connection_params(msg);
 }
 #endif
 
 void APIConnection::on_bluetooth_scanner_set_mode_request(const BluetoothScannerSetModeRequest &msg) {
-  bluetooth_proxy::global_bluetooth_proxy->bluetooth_scanner_set_mode(
-      msg.mode == enums::BluetoothScannerMode::BLUETOOTH_SCANNER_MODE_ACTIVE);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr) {
+    bluetooth_proxy::global_bluetooth_proxy->bluetooth_scanner_set_mode(
+        msg.mode == enums::BluetoothScannerMode::BLUETOOTH_SCANNER_MODE_ACTIVE);
+  }
 }
 #endif
 
@@ -1440,10 +1461,13 @@ void APIConnection::on_voice_assistant_set_configuration(const VoiceAssistantSet
 
 #ifdef USE_ZWAVE_PROXY
 void APIConnection::on_z_wave_proxy_frame(const ZWaveProxyFrame &msg) {
-  zwave_proxy::global_zwave_proxy->send_frame(this, msg.data, msg.data_len);
+  if (zwave_proxy::global_zwave_proxy != nullptr)
+    zwave_proxy::global_zwave_proxy->send_frame(this, msg.data, msg.data_len);
 }
 
 void APIConnection::on_z_wave_proxy_request(const ZWaveProxyRequest &msg) {
+  if (zwave_proxy::global_zwave_proxy == nullptr)
+    return;
   ZWaveProxyRequestResponse resp{};
   resp.type = msg.type;
   resp.status = zwave_proxy::global_zwave_proxy->zwave_proxy_request(this, msg.type);
@@ -1461,6 +1485,10 @@ bool APIConnection::send_sendspin_pairing_token_response_() {
   // never reach hello, and activating a key closes every session opened before it.
   if (!this->parent_->get_noise_ctx().has_psk()) {
     resp.status = enums::SENDSPIN_PAIRING_TOKEN_STATUS_ENCRYPTION_REQUIRED;
+    return this->send_message(resp);
+  }
+  if (sendspin_::global_sendspin_hub == nullptr) {
+    resp.status = enums::SENDSPIN_PAIRING_TOKEN_STATUS_NOT_READY;
     return this->send_message(resp);
   }
   auto token = sendspin_::global_sendspin_hub->get_pairing_token();
@@ -1975,7 +2003,7 @@ bool APIConnection::send_hello_response_(const HelloRequest &msg) {
   resp.api_version_minor = 20;
   // Send only the version string - the client only logs this for debugging and doesn't use it otherwise
   resp.server_info = esphome_version_ref();
-  resp.name = StringRef(App.get_name());
+  resp.name = network::device_name();
 
 #ifdef USE_PROVISIONING
   if (provisioning::global_provisioning_manager != nullptr && provisioning::global_provisioning_manager->closed()) {
@@ -2018,8 +2046,8 @@ bool APIConnection::send_ping_response_() {
 
 bool APIConnection::send_device_info_response_() {
   DeviceInfoResponse resp;
-  resp.name = StringRef(App.get_name());
-  resp.friendly_name = StringRef(App.get_friendly_name());
+  resp.name = network::device_name();
+  resp.friendly_name = network::device_friendly_name();
 #ifdef USE_AREAS
   resp.suggested_area = StringRef(App.get_area());
 #endif
@@ -2069,17 +2097,22 @@ bool APIConnection::send_device_info_response_() {
   resp.webserver_port = USE_WEBSERVER_PORT;
 #endif
 #ifdef USE_BLUETOOTH_PROXY
-  resp.bluetooth_proxy_feature_flags = bluetooth_proxy::global_bluetooth_proxy->get_feature_flags();
   char bluetooth_mac[MAC_ADDRESS_PRETTY_BUFFER_SIZE];
-  bluetooth_proxy::global_bluetooth_proxy->get_bluetooth_mac_address_pretty(bluetooth_mac);
-  resp.bluetooth_mac_address = StringRef(bluetooth_mac);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr) {
+    resp.bluetooth_proxy_feature_flags = bluetooth_proxy::global_bluetooth_proxy->get_feature_flags();
+    bluetooth_proxy::global_bluetooth_proxy->get_bluetooth_mac_address_pretty(bluetooth_mac);
+    resp.bluetooth_mac_address = StringRef(bluetooth_mac);
+  }
 #endif
 #ifdef USE_VOICE_ASSISTANT
-  resp.voice_assistant_feature_flags = voice_assistant::global_voice_assistant->get_feature_flags();
+  if (voice_assistant::global_voice_assistant != nullptr)
+    resp.voice_assistant_feature_flags = voice_assistant::global_voice_assistant->get_feature_flags();
 #endif
 #ifdef USE_ZWAVE_PROXY
-  resp.zwave_proxy_feature_flags = zwave_proxy::global_zwave_proxy->get_feature_flags();
-  resp.zwave_home_id = zwave_proxy::global_zwave_proxy->get_home_id();
+  if (zwave_proxy::global_zwave_proxy != nullptr) {
+    resp.zwave_proxy_feature_flags = zwave_proxy::global_zwave_proxy->get_feature_flags();
+    resp.zwave_home_id = zwave_proxy::global_zwave_proxy->get_home_id();
+  }
 #endif
 #ifdef USE_SERIAL_PROXY
   size_t serial_proxy_index = 0;
@@ -2134,17 +2167,22 @@ bool APIConnection::send_device_capabilities_response_() {
   // below in sync with send_device_info_response_() until those copies are removed.
   DeviceCapabilitiesResponse resp;
 #ifdef USE_BLUETOOTH_PROXY
-  resp.bluetooth_proxy.feature_flags = bluetooth_proxy::global_bluetooth_proxy->get_feature_flags();
   char bluetooth_mac[MAC_ADDRESS_PRETTY_BUFFER_SIZE];
-  bluetooth_proxy::global_bluetooth_proxy->get_bluetooth_mac_address_pretty(bluetooth_mac);
-  resp.bluetooth_proxy.mac_address = StringRef(bluetooth_mac);
+  if (bluetooth_proxy::global_bluetooth_proxy != nullptr) {
+    resp.bluetooth_proxy.feature_flags = bluetooth_proxy::global_bluetooth_proxy->get_feature_flags();
+    bluetooth_proxy::global_bluetooth_proxy->get_bluetooth_mac_address_pretty(bluetooth_mac);
+    resp.bluetooth_proxy.mac_address = StringRef(bluetooth_mac);
+  }
 #endif
 #ifdef USE_VOICE_ASSISTANT
-  resp.voice_assistant.feature_flags = voice_assistant::global_voice_assistant->get_feature_flags();
+  if (voice_assistant::global_voice_assistant != nullptr)
+    resp.voice_assistant.feature_flags = voice_assistant::global_voice_assistant->get_feature_flags();
 #endif
 #ifdef USE_ZWAVE_PROXY
-  resp.zwave_proxy.feature_flags = zwave_proxy::global_zwave_proxy->get_feature_flags();
-  resp.zwave_proxy.home_id = zwave_proxy::global_zwave_proxy->get_home_id();
+  if (zwave_proxy::global_zwave_proxy != nullptr) {
+    resp.zwave_proxy.feature_flags = zwave_proxy::global_zwave_proxy->get_feature_flags();
+    resp.zwave_proxy.home_id = zwave_proxy::global_zwave_proxy->get_home_id();
+  }
 #endif
 #ifdef USE_SERIAL_PROXY
   size_t serial_proxy_index = 0;
@@ -2161,8 +2199,10 @@ bool APIConnection::send_device_capabilities_response_() {
   resp.wizard.configured = true;
 #endif
 #if defined(USE_SENDSPIN) && defined(USE_ESP_IDF)
-  resp.sendspin.feature_flags = sendspin_::global_sendspin_hub->get_feature_flags();
-  resp.sendspin.client_id = sendspin_::global_sendspin_hub->get_client_id();
+  if (sendspin_::global_sendspin_hub != nullptr) {
+    resp.sendspin.feature_flags = sendspin_::global_sendspin_hub->get_feature_flags();
+    resp.sendspin.client_id = sendspin_::global_sendspin_hub->get_client_id();
+  }
 #endif
 #ifdef USE_STORE_YAML
   resp.store_yaml.supported = true;
