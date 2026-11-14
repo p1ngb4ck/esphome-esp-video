@@ -122,7 +122,6 @@ from .widgets import (
     Widget,
     add_widgets,
     get_screen_active,
-    lvgl_unit,
     set_obj_properties,
 )
 from .widgets.keyboard import attach_textareas
@@ -365,71 +364,7 @@ def lv_conf_path_flag(lv_conf_h_file: Path) -> str:
     return f'-DLV_CONF_PATH=\\"{path}\\"'
 
 
-def _register_core_widgets(configs, owned) -> None:
-    from .schemas import WIDGET_TYPES
-    from .widgets import get_widget_map
-
-    widget_map = get_widget_map()
-
-    def external(wid, wtype):
-        if wid not in owned and wid not in widget_map:
-            Widget.create(wid, MockObj(wid.id, "->"), wtype, {})
-
-    stack = list(configs)
-    while stack:
-        item = stack.pop()
-        if isinstance(item, list):
-            stack.extend(item)
-            continue
-        if not isinstance(item, dict):
-            continue
-        for pconf in item.get(CONF_PAGES, ()) if isinstance(item.get(CONF_PAGES), list) else ():
-            if isinstance(pconf, dict) and CONF_ID in pconf:
-                external(pconf[CONF_ID], page_spec)
-        if len(item) == 1:
-            key, value = next(iter(item.items()))
-            if key in WIDGET_TYPES and isinstance(value, dict) and CONF_ID in value:
-                external(value[CONF_ID], WIDGET_TYPES[key])
-        stack.extend(item.values())
-
-
-def lvgl_trigger_unit(conf):
-    return ("lvgl", str(conf[CONF_TRIGGER_ID]))
-
-
-async def _package_to_code(configs):
-    from .widgets.lv_list import finish_list_triggers
-
-    _register_core_widgets(
-        CORE.config.get(DOMAIN, []), CORE.data.get("package_manager_owned", set())
-    )
-    for config in configs:
-        lv_component = await cg.get_variable(config[CONF_ID])
-        Widget.create(config[CONF_ID], lv_component, LvScrActType(), config)
-        async with LvContext():
-            await add_pages(lv_component, config)
-            await layers_to_code(lv_component, config)
-    async with LvContext():
-        await finish_list_triggers()
-        await generate_triggers()
-        await generate_align_tos(configs[0])
-        await attach_textareas()
-        for config in configs:
-            await generate_page_triggers(config)
-
-
-DEPTH_IMAGE_FORMATS = {
-    16: ("I1", "A8", "RGB565", "RGB565A8", "RGB888", "ARGB8888"),
-    32: ("I1", "A8", "RGB565", "RGB565A8", "RGB888", "ARGB8888"),
-}
-
-
 async def to_code(configs):
-    from esphome.components.package_manager.build import package_pass
-
-    if package_pass():
-        await _package_to_code(configs)
-        return
     config_0 = configs[0]
     # Global configuration
     if CORE.is_esp32:
@@ -463,8 +398,6 @@ async def to_code(configs):
     df.add_define("LV_USE_STDLIB_MALLOC", "LV_STDLIB_CUSTOM")
     df.add_define("LV_DEF_REFR_PERIOD", "16")
     cg.add_define("USE_LVGL")
-    if config_0.get("config_cache"):
-        cg.add_define("USE_LVGL_CONFIG_CACHE")
     # suppress default enabling of extra widgets
     # cg.add_define("LV_KCONFIG_PRESENT")
     # Always enable - lots of things use it.
@@ -596,9 +529,7 @@ async def to_code(configs):
             await layers_to_code(lv_component, config)
             await lvgl_update(lv_component, config)
             await msgboxes_to_code(lv_component, config)
-            for animation in config.get(CONF_ANIMATIONS, []):
-                with CORE.codegen_unit(lvgl_unit(animation)):
-                    await animations_to_code([animation])
+            await animations_to_code(config.get(CONF_ANIMATIONS, []))
 
     async with LvContext():
         # Local import to avoid circularity
@@ -615,30 +546,23 @@ async def to_code(configs):
             await generate_page_triggers(config)
             await initial_focus_to_code(config)
             for conf in config.get(CONF_ON_IDLE, ()):
-                with CORE.codegen_unit(lvgl_trigger_unit(conf)):
-                    templ = await cg.templatable(conf[CONF_TIMEOUT], [], cg.uint32)
-                    idle_trigger = cg.new_Pvariable(
-                        conf[CONF_TRIGGER_ID], lv_component, templ
-                    )
-                    await build_automation(idle_trigger, [], conf)
+                templ = await cg.templatable(conf[CONF_TIMEOUT], [], cg.uint32)
+                idle_trigger = cg.new_Pvariable(
+                    conf[CONF_TRIGGER_ID], lv_component, templ
+                )
+                await build_automation(idle_trigger, [], conf)
             for trigger_name in SIMPLE_TRIGGERS:
                 if conf := config.get(trigger_name):
-                    with CORE.codegen_unit(lvgl_trigger_unit(conf)):
-                        trigger_var = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
-                        await build_automation(trigger_var, [], conf)
-                        cg.add(
-                            getattr(
-                                lv_component,
-                                f"set_{trigger_name.removeprefix('on_')}_trigger",
-                            )(trigger_var)
-                        )
+                    trigger_var = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
+                    await build_automation(trigger_var, [], conf)
+                    cg.add(
+                        getattr(
+                            lv_component,
+                            f"set_{trigger_name.removeprefix('on_')}_trigger",
+                        )(trigger_var)
+                    )
 
     # This must be done after all widgets are created
-    if (CORE.config.get("package_manager") or {}).get("packages"):
-        from .schemas import WIDGET_TYPES
-
-        for widget_type in WIDGET_TYPES.values():
-            df.add_lv_use(widget_type.name, *widget_type.get_uses())
     styles_used = df.get_styles_used()
     apply_style_driven_defines(styles_used)
     for use in df.get_lv_uses():
@@ -651,7 +575,6 @@ async def to_code(configs):
     # The display buffer format is always needed, RGB565 is used by canvas buffers and
     # ARGB8888 for layer blending
     lv_image_formats = {"RGB565", display_format, "ARGB8888"}
-    lv_image_formats.update(DEPTH_IMAGE_FORMATS[config_0[CONF_COLOR_DEPTH]])
 
     for image_id in get_lv_images_used():
         await cg.get_variable(image_id)
@@ -733,7 +656,6 @@ LVGL_TOP_LEVEL_SCHEMA = (
             ),  # 32 = RGB888 (3 bytes/px) on ESP32-P4
             cv.Optional(df.CONF_DEFAULT_FONT, default="montserrat_14"): lvalid.lv_font,
             cv.Optional(df.CONF_FULL_REFRESH, default=False): cv.boolean,
-            cv.Optional("config_cache", default=False): cv.boolean,
             cv.Optional(df.CONF_UPDATE_WHEN_DISPLAY_IDLE, default=False): cv.boolean,
             cv.Optional(df.CONF_REFRESH_INTERVAL): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_DRAW_ROUNDING, default=2): cv.positive_int,
