@@ -137,6 +137,7 @@ void HOT Scheduler::set_timer_common_(Component *component, SchedulerItem::Type 
     delay = 1;
   }
 
+  uint32_t offset = 0;
   // Take lock early to protect scheduler_item_pool_head_ access
   {
     LockGuard guard{this->lock_};
@@ -181,13 +182,8 @@ void HOT Scheduler::set_timer_common_(Component *component, SchedulerItem::Type 
       if (type == SchedulerItem::INTERVAL) {
         item->interval = delay;
         // first execution happens immediately after a random smallish offset
-        uint32_t offset = this->calculate_interval_offset_(delay);
+        offset = this->calculate_interval_offset_(delay);
         item->set_next_execution(now_64 + offset);
-#ifdef ESPHOME_LOG_HAS_VERBOSE
-        SchedulerNameLog name_log;
-        ESP_LOGV(TAG, "Scheduler interval for %s is %" PRIu32 "ms, offset %" PRIu32 "ms",
-                 name_log.format(name_type, static_name, hash_or_id), delay, offset);
-#endif
       } else {
         item->interval = 0;
         item->set_next_execution(now_64 + delay);
@@ -213,6 +209,14 @@ void HOT Scheduler::set_timer_common_(Component *component, SchedulerItem::Type 
     }
 #endif
   }
+#ifdef ESPHOME_LOG_HAS_VERBOSE
+  // Logged after releasing the lock: a logger on_message automation can call back into the scheduler.
+  if (type == SchedulerItem::INTERVAL) {
+    SchedulerNameLog name_log;
+    ESP_LOGV(TAG, "Scheduler interval for %s is %" PRIu32 "ms, offset %" PRIu32 "ms",
+             name_log.format(name_type, static_name, hash_or_id), delay, offset);
+  }
+#endif
   // A background insertion may shorten a sleep whose deadline was already computed.
   if (!is_main_loop_thread()) [[unlikely]]
     wake_scheduler_threadsafe();
@@ -329,7 +333,7 @@ void Scheduler::full_cleanup_removed_items_() {
   }
   this->items_.erase(this->items_.begin() + write, this->items_.end());
   // Rebuild the heap structure since items are no longer in heap order
-  std::make_heap(this->items_.begin(), this->items_.end(), SchedulerItem::cmp);
+  std::make_heap(this->items_.begin(), this->items_.end(), SchedulerItem::Cmp{});
   this->to_remove_clear_locked_();
 }
 
@@ -456,7 +460,7 @@ uint32_t HOT Scheduler::call(uint32_t now) {
       LockGuard guard{this->lock_};
       this->items_ = std::move(old_items);
       // Rebuild heap after moving items back
-      std::make_heap(this->items_.begin(), this->items_.end(), SchedulerItem::cmp);
+      std::make_heap(this->items_.begin(), this->items_.end(), SchedulerItem::Cmp{});
     }
   }
 #endif /* ESPHOME_DEBUG_SCHEDULER */
@@ -483,13 +487,6 @@ uint32_t HOT Scheduler::call(uint32_t now) {
       // Not reached timeout yet, done for this call
       break;
     }
-    // Don't run on failed components (is_item_failed_ exempts SELF_POINTER delays).
-    if (this->is_item_failed_(item)) {
-      LockGuard guard{this->lock_};
-      this->recycle_item_main_loop_(this->pop_raw_locked_());
-      continue;
-    }
-
     // Check if item is marked for removal
     // This handles two cases:
     // 1. Item was marked for removal after cleanup_() but before we got here
@@ -513,6 +510,13 @@ uint32_t HOT Scheduler::call(uint32_t now) {
       continue;
     }
 #endif
+
+    // Don't run on failed components (is_item_failed_ exempts SELF_POINTER delays).
+    if (this->is_item_failed_(item)) {
+      LockGuard guard{this->lock_};
+      this->recycle_item_main_loop_(this->pop_raw_locked_());
+      continue;
+    }
 
 #ifdef ESPHOME_DEBUG_SCHEDULER
     {
@@ -556,7 +560,7 @@ uint32_t HOT Scheduler::call(uint32_t now) {
       // This avoids the to_add_ detour and the overhead of
       // process_to_add_slow_path_() (lock acquisition, vector iteration, clear).
       this->items_.push_back(executed_item);
-      std::push_heap(this->items_.begin(), this->items_.end(), SchedulerItem::cmp);
+      std::push_heap(this->items_.begin(), this->items_.end(), SchedulerItem::Cmp{});
     } else {
       // Timeout completed - recycle it
       this->recycle_item_main_loop_(executed_item);
@@ -598,7 +602,7 @@ void HOT Scheduler::process_to_add_slow_path_() {
     }
 
     this->items_.push_back(it);
-    std::push_heap(this->items_.begin(), this->items_.end(), SchedulerItem::cmp);
+    std::push_heap(this->items_.begin(), this->items_.end(), SchedulerItem::Cmp{});
   }
   this->to_add_.clear();
   this->to_add_count_clear_locked_();
@@ -623,7 +627,7 @@ bool HOT Scheduler::cleanup_slow_path_() {
   return !this->items_.empty();
 }
 Scheduler::SchedulerItem *HOT Scheduler::pop_raw_locked_() {
-  std::pop_heap(this->items_.begin(), this->items_.end(), SchedulerItem::cmp);
+  std::pop_heap(this->items_.begin(), this->items_.end(), SchedulerItem::Cmp{});
 
   SchedulerItem *item = this->items_.back();
   this->items_.pop_back();
@@ -726,13 +730,6 @@ bool HOT Scheduler::cancel_item_locked_(Component *component, NameType name_type
                                                                hash_or_id, type, find_first);
 
   return total_cancelled > 0;
-}
-
-bool HOT Scheduler::SchedulerItem::cmp(SchedulerItem *a, SchedulerItem *b) {
-  // High bits are almost always equal (change only on 32-bit rollover ~49 days)
-  // Optimize for common case: check low bits first when high bits are equal
-  return (a->next_execution_high_ == b->next_execution_high_) ? (a->next_execution_low_ > b->next_execution_low_)
-                                                              : (a->next_execution_high_ > b->next_execution_high_);
 }
 
 // Recycle a SchedulerItem back to the freelist for reuse.
