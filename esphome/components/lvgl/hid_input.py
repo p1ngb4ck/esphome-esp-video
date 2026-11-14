@@ -223,6 +223,7 @@ async def key_bindings_to_code(config):
 
 async def hid_inputs_to_code(lv_component, config, default_group):
     bindings = None
+    if config.get(CONF_HID_KEYBOARDS):
         add_lv_use("HID")
         bindings = await key_bindings_to_code(config[CONF_KEY_BINDINGS])
     for conf in config.get(CONF_HID_KEYBOARDS) or ():
