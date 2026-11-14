@@ -6,22 +6,11 @@
 
 #include "core/lv_global.h"
 #include "core/lv_obj_class_private.h"
-#include "core/lv_group_private.h"
-#include "core/lv_obj_style_private.h"
 #include "core/lv_obj_private.h"
 #include "core/lv_refr_private.h"
 #include "display/lv_display_private.h"
 #include "misc/lv_area_private.h"
 #include "misc/lv_text_private.h"
-#ifdef USE_LVGL_CONFIG_CACHE
-#include "esp_rom_crc.h"
-#ifdef USE_SAFE_MODE_SPLIT
-#include "esphome/components/safe_mode/safe_mode.h"
-#endif
-#endif
-#ifdef USE_LVGL_MENU
-#include "widgets/menu/lv_menu_private.h"
-#endif
 
 #include <algorithm>
 #include <climits>
@@ -247,15 +236,10 @@ void LvglComponent::set_paused(bool paused, bool show_snow) {
     this->pause_callback_->trigger();
   if (!paused && this->resume_callback_ != nullptr)
     this->resume_callback_->trigger();
-  if (!paused)
-    this->resume_callbacks_.call();
 }
 
 void LvglComponent::esphome_lvgl_init() {
   lv_init();
-#ifdef USE_LVGL_CONFIG_CACHE
-  lv_obj_enable_style_refresh(false);
-#endif
   // override draw buf alloc to ensure proper alignment for PPA
   LV_GLOBAL_DEFAULT()->draw_buf_handlers.buf_malloc_cb = draw_buf_alloc_cb;
   LV_GLOBAL_DEFAULT()->draw_buf_handlers.buf_free_cb = lv_free_core;
@@ -267,14 +251,8 @@ void LvglComponent::esphome_lvgl_init() {
   lv_update_event = static_cast<lv_event_code_t>(lv_event_register_id());
 }
 
-static void remove_event_cb(void *obj, void *callback, void *user_data) {
-  lv_obj_remove_event_cb_with_user_data(static_cast<lv_obj_t *>(obj), reinterpret_cast<lv_event_cb_t>(callback),
-                                        user_data);
-}
-
 void LvglComponent::add_event_cb(lv_obj_t *obj, event_callback_t callback, lv_event_code_t event, void *user_data) {
   lv_obj_add_event_cb(obj, callback, event, user_data);
-  note_registration(remove_event_cb, obj, reinterpret_cast<void *>(callback), user_data);
 }
 
 void LvglComponent::add_event_cb(lv_obj_t *obj, event_callback_t callback, lv_event_code_t event1,
@@ -320,36 +298,11 @@ void LvglComponent::lv_obj_set_custom_flag(lv_obj_t *obj, lv_obj_flag_t flag, bo
   }
 }
 
-static void remove_page_registration(void *component, void *page, void *unused) {
-  static_cast<LvglComponent *>(component)->remove_page(static_cast<LvPageType *>(page));
-}
-
 void LvglComponent::add_page(LvPageType *page) {
   this->pages_.push_back(page);
   page->set_parent(this);
   lv_display_set_default(this->disp_);
   page->setup(this->pages_.size() - 1);
-  note_registration(remove_page_registration, this, page, nullptr);
-}
-
-void LvglComponent::remove_page(LvPageType *page) {
-  auto it = std::find(this->pages_.begin(), this->pages_.end(), page);
-  if (it == this->pages_.end())
-    return;
-  const size_t index = it - this->pages_.begin();
-  const bool showing = page->obj != nullptr && lv_screen_active() == page->obj;
-  this->pages_.erase(it);
-  for (size_t i = index; i < this->pages_.size(); i++)
-    this->pages_[i]->index = i;
-  if (showing && !this->pages_.empty()) {
-    this->current_page_ = 0;
-    lv_screen_load(this->pages_[0]->obj);
-  } else if (this->current_page_ > index) {
-    this->current_page_--;
-  }
-  if (page->obj != nullptr)
-    lv_obj_delete(page->obj);
-  page->obj = nullptr;
 }
 
 void LvglComponent::show_page(size_t index, lv_screen_load_anim_t anim, uint32_t time) {
@@ -1224,8 +1177,7 @@ void LvglComponent::video_canvas_close() {
   App.wake_loop_threadsafe();
 }
 
-bool LvglComponent::vc_shown_now_(lv_area_t *rows, lv_area_t *over) const {
-  *over = lv_area_t{0, 0, -1, -1};
+bool LvglComponent::vc_shown_now_(lv_area_t *rows) const {
   if (this->vc_marker_ == nullptr || this->paused_ || this->scanout_[0] == nullptr ||
       lv_obj_get_screen(this->vc_marker_) != lv_screen_active() || !lv_obj_is_visible(this->vc_marker_))
     return false;
@@ -1237,97 +1189,10 @@ bool LvglComponent::vc_shown_now_(lv_area_t *rows, lv_area_t *over) const {
   this->scanout_rect_(&box, x, y, w, h);
   const int32_t y1 = (y + 1) & ~1;
   const int32_t y2 = (y + h) & ~1;
-  if (x != 0 || w != static_cast<int32_t>(this->width_) || y2 <= y1)
+  if (x != 0 || w != static_cast<int32_t>(this->width_) || y2 <= y1 || this->top_layer_over_(&box))
     return false;
   this->panel_to_area_(0, y1, w, y2 - y1, rows);
-  lv_obj_t *top = lv_layer_top();
-  const uint32_t count = lv_obj_get_child_count(top);
-  for (uint32_t i = 0; i != count; i++) {
-    lv_obj_t *child = lv_obj_get_child(top, static_cast<int32_t>(i));
-    if (lv_obj_is_hidden(child))
-      continue;
-    lv_area_t area;
-    lv_obj_get_coords(child, &area);
-    lv_area_t part;
-    if (!lv_area_intersect(&part, &area, rows))
-      continue;
-    if (lv_area_get_width(over) <= 0) {
-      *over = part;
-    } else {
-      lv_area_join(over, over, &part);
-    }
-  }
   return true;
-}
-
-void LvglComponent::vc_overlay_set_(const lv_area_t *over) {
-  heap_caps_free(this->vc_over_buf_);
-  this->vc_over_buf_ = nullptr;
-  this->vc_over_ready_ = false;
-  this->vc_over_ = lv_area_t{0, 0, -1, -1};
-  if (lv_area_get_width(over) <= 0 || lv_area_get_height(over) <= 0)
-    return;
-  int32_t x, y, w, h;
-  this->scanout_rect_(over, x, y, w, h);
-  this->vc_over_buf_ = static_cast<uint8_t *>(
-      heap_caps_calloc(1, static_cast<size_t>(h) * this->scanout_stride_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (this->vc_over_buf_ == nullptr)
-    return;
-  this->vc_over_ = *over;
-  this->vc_over_y_ = y;
-  this->vc_over_h_ = h;
-  lv_inv_area(this->disp_, over);
-}
-
-void LvglComponent::vc_overlay_draw_(const lv_area_t *area, const uint8_t *src) {
-  lv_area_t clip;
-  if (this->vc_over_buf_ == nullptr || !lv_area_intersect(&clip, area, &this->vc_over_))
-    return;
-  const int32_t src_w = lv_area_get_width(area);
-  const int32_t sx = clip.x1 - area->x1;
-  const int32_t sy = clip.y1 - area->y1;
-  const int32_t cw = lv_area_get_width(&clip);
-  const int32_t ch = lv_area_get_height(&clip);
-  int32_t x, y, w, h;
-  this->scanout_rect_(&clip, x, y, w, h);
-  y -= this->vc_over_y_;
-  if (y < 0 || y + h > this->vc_over_h_)
-    return;
-  const auto rotation =
-      this->rotation_type_ == ROTATION_SOFTWARE ? this->rotation_ : display::DISPLAY_ROTATION_0_DEGREES;
-  const auto *in = reinterpret_cast<const ScanoutPixel *>(src);
-  auto *out = reinterpret_cast<ScanoutPixel *>(this->vc_over_buf_);
-  const size_t stride = this->width_;
-  for (int32_t r = 0; r != ch; r++) {
-    const ScanoutPixel *row = in + static_cast<size_t>(sy + r) * src_w + sx;
-    switch (rotation) {
-      case display::DISPLAY_ROTATION_90_DEGREES:
-        for (int32_t c = 0; c != cw; c++)
-          out[static_cast<size_t>(y + c) * stride + x + ch - 1 - r] = row[c];
-        break;
-      case display::DISPLAY_ROTATION_180_DEGREES:
-        for (int32_t c = 0; c != cw; c++)
-          out[static_cast<size_t>(y + ch - 1 - r) * stride + x + cw - 1 - c] = row[c];
-        break;
-      case display::DISPLAY_ROTATION_270_DEGREES:
-        for (int32_t c = 0; c != cw; c++)
-          out[static_cast<size_t>(y + cw - 1 - c) * stride + x + r] = row[c];
-        break;
-      default:
-        std::memcpy(out + static_cast<size_t>(y + r) * stride + x, row, cw * SCANOUT_BPP);
-        break;
-    }
-  }
-  this->vc_over_ready_ = true;
-}
-
-void LvglComponent::vc_overlay_apply_() {
-  if (this->vc_over_buf_ == nullptr || !this->vc_over_ready_)
-    return;
-  uint8_t *back = this->scanout_[this->scanout_back_] + static_cast<size_t>(this->vc_over_y_) * this->scanout_stride_;
-  const size_t len = static_cast<size_t>(this->vc_over_h_) * this->scanout_stride_;
-  std::memcpy(back, this->vc_over_buf_, len);
-  esp_cache_msync(back, len, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 }
 
 uint8_t LvglComponent::vc_outside_(const lv_area_t *area, lv_area_t *parts) const {
@@ -1340,8 +1205,6 @@ uint8_t LvglComponent::vc_outside_(const lv_area_t *area, lv_area_t *parts) cons
 }
 
 void LvglComponent::vc_drop_() {
-  const lv_area_t none{0, 0, -1, -1};
-  this->vc_overlay_set_(&none);
   this->vc_shown_.store(false);
   this->vc_rows_ = lv_area_t{0, 0, -1, -1};
   this->vc_ui_back_ = false;
@@ -1358,11 +1221,7 @@ void LvglComponent::vc_drop_() {
 
 void LvglComponent::vc_service_() {
   lv_area_t rows{0, 0, -1, -1};
-  lv_area_t over{0, 0, -1, -1};
-  const bool shown = this->vc_shown_now_(&rows, &over);
-  if (!lv_area_is_equal(&over, &this->vc_over_) &&
-      (lv_area_get_width(&over) > 0 || this->vc_over_buf_ != nullptr))
-    this->vc_overlay_set_(&over);
+  const bool shown = this->vc_shown_now_(&rows);
   if (shown != this->vc_shown_.load() || (shown && !lv_area_is_equal(&rows, &this->vc_rows_))) {
     if (this->vc_shown_.load())
       lv_inv_area(this->disp_, &this->vc_rows_);
@@ -1374,10 +1233,8 @@ void LvglComponent::vc_service_() {
   }
   uint8_t state = this->vc_state_.load();
   if (state == VC_DONE || state == VC_DONE_NEXT) {
-    if (this->vc_ok_.load() && shown && this->vc_target_.layout == this->vc_layout_) {
-      this->vc_overlay_apply_();
+    if (this->vc_ok_.load() && shown && this->vc_target_.layout == this->vc_layout_)
       this->present_scanout_();
-    }
     this->vc_ui_back_ = false;
     uint8_t done = VC_DONE;
     if (!this->vc_state_.compare_exchange_strong(done, VC_IDLE))
@@ -1412,8 +1269,6 @@ void LvglComponent::vc_service_() {
   if (state != VC_IDLE)
     return;
   if (this->vc_ui_back_ && (!this->vc_fed_.load() || !shown)) {
-    if (shown)
-      this->vc_overlay_apply_();
     this->present_scanout_();
     this->vc_ui_back_ = false;
   }
@@ -1443,8 +1298,6 @@ void LvglComponent::flush_cb_(lv_display_t *disp_drv, const lv_area_t *area, uin
       const uint8_t count = this->vc_outside_(area, parts);
       for (uint8_t i = 0; i != count; i++)
         this->draw_scanout_(area, color_p, this->scanout_[this->scanout_back_], &parts[i]);
-      if (this->vc_over_buf_ != nullptr)
-        this->vc_overlay_draw_(area, color_p);
 #else
       this->draw_scanout_(area, color_p, this->scanout_[this->scanout_back_]);
 #endif
@@ -2977,194 +2830,7 @@ void LvglComponent::update_orientation_() {
     trigger->trigger();
 }
 
-static LvglComponent *stop_guard = nullptr;
-static bool lvgl_blocks_package_stop() { return stop_guard != nullptr && stop_guard->is_paused(); }
-
-#ifdef USE_LVGL_CONFIG_CACHE
-struct ConfigHeader {
-  uint32_t magic;
-  uint32_t fingerprint;
-  uint32_t screens;
-  uint32_t crc;
-};
-
-struct ConfigRecord {
-  lv_area_t coords;
-  int32_t scroll_x;
-  int32_t scroll_y;
-  int32_t ext_draw_size;
-  uint32_t text;
-};
-
-static constexpr uint32_t CONFIG_MAGIC = 0x4C564346;
-
-template<typename F> static void walk_object(lv_obj_t *obj, F &visit) {
-  visit(obj);
-  const uint32_t count = lv_obj_get_child_count(obj);
-  for (uint32_t i = 0; i < count; i++)
-    walk_object(obj->spec_attr->children[i], visit);
-}
-
-template<typename F> static void walk_display(lv_display_t *disp, F &&visit) {
-  for (uint32_t i = 0; i < disp->screen_cnt; i++)
-    walk_object(disp->screens[i], visit);
-}
-
-static uint32_t config_text_hash(lv_obj_t *obj) {
-#if LV_USE_LABEL
-  if (lv_obj_check_type(obj, &lv_label_class)) {
-    const char *text = lv_label_get_text(obj);
-    if (text != nullptr)
-      return esp_rom_crc32_le(0, reinterpret_cast<const uint8_t *>(text), strlen(text));
-  }
-#endif
-  return 0;
-}
-
-uint32_t LvglComponent::config_fingerprint(uint32_t seed, const void *data, size_t len) {
-  return esp_rom_crc32_le(seed, static_cast<const uint8_t *>(data), len);
-}
-
-size_t LvglComponent::config_state_size() {
-  size_t count = 0;
-  walk_display(this->disp_, [&count](lv_obj_t *) { count++; });
-  return sizeof(ConfigHeader) + this->disp_->screen_cnt * sizeof(uint32_t) + count * sizeof(ConfigRecord);
-}
-
-static uint32_t config_tree_size(lv_obj_t *root) {
-  uint32_t count = 0;
-  auto visit = [&count](lv_obj_t *) { count++; };
-  walk_object(root, visit);
-  return count;
-}
-
-template<typename F> static void config_for_each_screen(lv_display_t *disp, const uint8_t *body, F &&visit) {
-  const uint8_t *cursor = body;
-  for (uint32_t s = 0; s < disp->screen_cnt; s++) {
-    const uint32_t stored = *reinterpret_cast<const uint32_t *>(cursor);
-    cursor += sizeof(uint32_t);
-    visit(disp->screens[s], reinterpret_cast<const ConfigRecord *>(cursor), stored,
-          stored == config_tree_size(disp->screens[s]));
-    cursor += stored * sizeof(ConfigRecord);
-  }
-}
-
-void LvglComponent::config_state_save(uint8_t *out, size_t size, uint32_t fingerprint) {
-  for (uint32_t i = 0; i < this->disp_->screen_cnt; i++)
-    lv_obj_update_layout(this->disp_->screens[i]);
-  uint8_t *cursor = out + sizeof(ConfigHeader);
-  const uint8_t *const end = out + size;
-  for (uint32_t s = 0; s < this->disp_->screen_cnt; s++) {
-    auto *stored = reinterpret_cast<uint32_t *>(cursor);
-    cursor += sizeof(uint32_t);
-    uint32_t count = 0;
-    auto visit = [&](lv_obj_t *obj) {
-      if (cursor + sizeof(ConfigRecord) > end)
-        return;
-      auto &record = *reinterpret_cast<ConfigRecord *>(cursor);
-      record.coords = obj->coords;
-      record.scroll_x = obj->spec_attr != nullptr ? obj->spec_attr->scroll.x : 0;
-      record.scroll_y = obj->spec_attr != nullptr ? obj->spec_attr->scroll.y : 0;
-      record.ext_draw_size = obj->spec_attr != nullptr ? obj->spec_attr->ext_draw_size : 0;
-      record.text = config_text_hash(obj);
-      cursor += sizeof(ConfigRecord);
-      count++;
-    };
-    walk_object(this->disp_->screens[s], visit);
-    *stored = count;
-  }
-  auto *header = reinterpret_cast<ConfigHeader *>(out);
-  header->magic = CONFIG_MAGIC;
-  header->fingerprint = fingerprint;
-  header->screens = this->disp_->screen_cnt;
-  header->crc = esp_rom_crc32_le(0, out + sizeof(ConfigHeader), size - sizeof(ConfigHeader));
-}
-
-bool LvglComponent::config_state_load(const uint8_t *data, size_t size, uint32_t fingerprint) {
-  if (data == nullptr || size < sizeof(ConfigHeader)) {
-    ESP_LOGI(TAG, "UI config: none stored");
-    return false;
-  }
-  const auto *header = reinterpret_cast<const ConfigHeader *>(data);
-  if (header->magic != CONFIG_MAGIC || header->fingerprint != fingerprint) {
-    ESP_LOGI(TAG, "UI config: changed, generating");
-    return false;
-  }
-  const uint8_t *const body = data + sizeof(ConfigHeader);
-  if (header->screens != this->disp_->screen_cnt ||
-      esp_rom_crc32_le(0, body, size - sizeof(ConfigHeader)) != header->crc) {
-    ESP_LOGW(TAG, "UI config: stored state does not fit, generating");
-    return false;
-  }
-  uint32_t loaded = 0;
-  uint32_t rebuilt = 0;
-  config_for_each_screen(this->disp_, body, [&](lv_obj_t *screen, const ConfigRecord *records, uint32_t, bool fits) {
-    if (!fits) {
-      rebuilt++;
-      return;
-    }
-    size_t index = 0;
-    auto restore = [&](lv_obj_t *obj) {
-      const ConfigRecord &record = records[index++];
-      obj->coords = record.coords;
-      if (obj->spec_attr == nullptr && (record.ext_draw_size != 0 || record.scroll_x != 0 || record.scroll_y != 0))
-        lv_obj_allocate_spec_attr(obj);
-      if (obj->spec_attr != nullptr) {
-        obj->spec_attr->ext_draw_size = record.ext_draw_size;
-        obj->spec_attr->scroll.x = record.scroll_x;
-        obj->spec_attr->scroll.y = record.scroll_y;
-      }
-      lv_obj_update_layer_type(obj);
-      lv_obj_update_blur_status(obj);
-    };
-    walk_object(screen, restore);
-    loaded += index;
-    auto changed = [](lv_obj_t *obj) { lv_obj_send_event(obj, LV_EVENT_STYLE_CHANGED, nullptr); };
-    walk_object(screen, changed);
-    index = 0;
-    auto settle = [&](lv_obj_t *obj) {
-      const ConfigRecord &record = records[index++];
-      obj->layout_inv = 0;
-      obj->scr_layout_inv = 0;
-      obj->readjust_scroll_after_layout = 0;
-      if (record.text != config_text_hash(obj))
-        lv_obj_mark_layout_as_dirty(obj);
-    };
-    walk_object(screen, settle);
-  });
-  this->config_held_ = false;
-  lv_obj_enable_style_refresh(true);
-  if (rebuilt != 0) {
-    config_for_each_screen(this->disp_, body, [](lv_obj_t *screen, const ConfigRecord *, uint32_t, bool fits) {
-      if (fits)
-        return;
-      lv_obj_refresh_style(screen, LV_PART_ANY, LV_STYLE_PROP_ANY);
-      lv_obj_update_layout(screen);
-    });
-  }
-  ESP_LOGI(TAG, "UI config: loaded, %u objects, %u screens rebuilt", (unsigned) loaded, (unsigned) rebuilt);
-  return true;
-}
-
-void LvglComponent::config_state_generate() {
-  if (!this->config_held_ || this->disp_ == nullptr)
-    return;
-  this->config_held_ = false;
-  lv_obj_enable_style_refresh(true);
-  lv_obj_report_style_change(nullptr);
-  for (uint32_t i = 0; i < this->disp_->screen_cnt; i++)
-    lv_obj_update_layout(this->disp_->screens[i]);
-}
-#endif
-
-void LvglComponent::for_each_group_object(lv_group_t *group, void (*callback)(lv_obj_t *)) {
-  for (void *node = lv_ll_get_head(&group->obj_ll); node != nullptr; node = lv_ll_get_next(&group->obj_ll, node))
-    callback(*static_cast<lv_obj_t **>(node));
-}
-
 void LvglComponent::setup() {
-  stop_guard = this;
-  package_stop_blocked = lvgl_blocks_package_stop;
   auto *display = this->displays_[0];
   auto rounding = this->draw_rounding;
   this->width_ = display->get_native_width();
@@ -3303,15 +2969,6 @@ void LvglComponent::loop() {
     hold = hold || this->scanout_wait_ || this->vc_ui_back_ || this->vc_state_.load() != VC_IDLE;
   }
 #endif
-#ifdef USE_LVGL_CONFIG_CACHE
-#ifdef USE_SAFE_MODE_SPLIT
-  if (this->config_held_ && safe_mode::global_safe_mode_component != nullptr &&
-      safe_mode::global_safe_mode_component->get_target_level() < safe_mode::LEVEL_NORMAL &&
-      safe_mode::global_safe_mode_component->tiers_ready())
-    this->config_state_generate();
-#endif
-  hold = hold || this->config_held_;
-#endif
   if (hold && !this->refr_timer_paused_) {
     this->refr_timer_paused_ = true;
     // calling lv_timer_pause() here would be ineffective; LVGL pauses and resumes the timer based on its own internal
@@ -3401,11 +3058,8 @@ lv_color_t lv_grad_calculate_color(const lv_grad_dsc_t *dsc, int32_t pos) {
 
 #ifdef USE_LVGL_MENU
 bool lv_menu_back_button_is_root_click(lv_obj_t *menu, lv_event_t *e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED)
-    return false;
-  const auto *data = reinterpret_cast<const lv_menu_t *>(menu);
-  const auto *target = static_cast<lv_obj_t *>(lv_event_get_target(e));
-  return target == data->sidebar_header_back_btn || (target == data->main_header_back_btn && data->prev_depth <= 1);
+  return lv_event_get_code(e) == LV_EVENT_CLICKED &&
+         lv_menu_back_button_is_root(menu, static_cast<lv_obj_t *>(lv_event_get_target(e)));
 }
 #endif  // USE_LVGL_MENU
 
