@@ -42,8 +42,8 @@ class AviMediaPlayer : public Component, public media_player::MediaPlayer {
 #endif
   void set_buffer_size(size_t size) { this->ring_size_ = size; }
   void set_frame_size(size_t size) { this->frame_size_ = size; }
-  void set_audio_latency(uint32_t ms) { this->audio_latency_us_ = ms * 1000; }
-  void set_audio_latency_lambda(std::function<uint32_t()> &&latency) { this->latency_fn_ = std::move(latency); }
+  void set_audio_latency(int32_t ms) { this->audio_latency_us_ = ms * 1000; }
+  void set_audio_latency_lambda(std::function<int32_t()> &&latency) { this->latency_fn_ = std::move(latency); }
   enum Error : uint8_t { ERROR_NONE, ERROR_NOT_FOUND, ERROR_FORMAT, ERROR_MEMORY, ERROR_DECODE };
   Error last_error() const { return this->error_.load(); }
   const std::string &current_file() const { return this->path_; }
@@ -72,6 +72,9 @@ class AviMediaPlayer : public Component, public media_player::MediaPlayer {
   void wait_until_(int64_t when_us);
 #ifdef USE_SPEAKER
   bool sound_start_(const AVIStreamInfo *info);
+  bool pcm_hold_start_(const AVIStreamInfo *info);
+  bool sound_task_start_();
+  void pcm_loop_();
   void sound_stop_();
   void sound_chunk_(const uint8_t *data, size_t len);
   static void sound_entry_(void *arg);
@@ -101,8 +104,11 @@ class AviMediaPlayer : public Component, public media_player::MediaPlayer {
   std::unique_ptr<BufferedFileReader> reader_;
   std::unique_ptr<AVIParser> parser_;
   uint32_t frame_us_{40000};
-  uint32_t audio_latency_us_{0};
-  std::function<uint32_t()> latency_fn_{};
+  int32_t audio_latency_us_{0};
+  std::function<int32_t()> latency_fn_{};
+  uint32_t sound_hold_ms_{0};
+  bool pcm_held_{false};
+  uint8_t *pcm_chunk_{nullptr};
   std::atomic<Error> error_{ERROR_NONE};
   bool pcm_{false};
 #ifdef USE_SPEAKER
