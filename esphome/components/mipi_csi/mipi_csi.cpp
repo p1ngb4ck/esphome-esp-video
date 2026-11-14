@@ -5,8 +5,11 @@
 #ifdef USE_ESP32_VARIANT_ESP32P4
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <cerrno>
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -31,6 +34,7 @@ ESPHOME_LOG_TAG(TAG, "mipi_csi");
 static constexpr uint32_t CAPTURE_TASK_STACK_SIZE = 4096;
 static constexpr UBaseType_t CAPTURE_TASK_PRIORITY = 1;
 static constexpr BaseType_t CAPTURE_TASK_CORE = 1;
+static constexpr uint32_t JPEG_ENGINE_TIMEOUT_MS = 200;
 
 /// How a configured pixel format maps onto the video device and the JPEG encoder.
 struct FormatMapping {
@@ -68,8 +72,16 @@ static void format_fourcc(uint32_t fourcc, FourccName out) {
 
 /* ---------------- MipiCsiCamera: setup ---------------- */
 
+static uint8_t *psram_alloc(size_t size) {
+  return static_cast<uint8_t *>(heap_caps_aligned_alloc(128, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+}
+
+static void psram_free(uint8_t *ptr) { heap_caps_free(ptr); }
+
 void MipiCsiCamera::setup() {
   if (this->alloc_ == nullptr || this->free_ == nullptr) {
+    this->alloc_ = psram_alloc;
+    this->free_ = psram_free;
   }
   if (!this->start_external_clock_()) {
     this->mark_failed();
@@ -145,8 +157,166 @@ bool MipiCsiCamera::init_video_() {
   return true;
 }
 
+void MipiCsiCamera::add_resolution(uint16_t width, uint16_t height, uint8_t fps) {
+  for (uint8_t i = 0; i != this->resolution_count_; i++) {
+    Resolution &known = this->resolutions_[i];
+    if (known.width == width && known.height == height) {
+      known.fps = std::max(known.fps, fps);
+      return;
+    }
+  }
+  if (this->resolution_count_ != MAX_RESOLUTIONS)
+    this->resolutions_[this->resolution_count_++] = Resolution{width, height, fps};
+}
+
+void MipiCsiCamera::collect_resolutions_() {
+  v4l2_sensor_format_enum enumerator{};
+  for (enumerator.index = 0; ioctl(this->fd_, VIDIOC_ENUM_SENSOR_FMT, &enumerator) == 0; enumerator.index++) {
+    const esp_cam_sensor_format_t &format = enumerator.format;
+    if (format.port == ESP_CAM_SENSOR_MIPI_CSI)
+      this->add_resolution(format.width, format.height, format.fps);
+  }
+}
+
+bool MipiCsiCamera::switch_resolution(uint16_t width, uint16_t height) {
+  bool known = this->resolution_count_ == 0;
+  for (uint8_t i = 0; i != this->resolution_count_ && !known; i++)
+    known = this->resolutions_[i].width == width && this->resolutions_[i].height == height;
+  if (!known || width == 0 || height == 0)
+    return false;
+  if (width == this->width_ && height == this->height_)
+    return true;
+  this->width_ = width;
+  this->height_ = height;
+  if (this->state_ == State::RUNNING) {
+    this->state_ = State::STOPPING;
+    this->stop_wanted_.store(true);
+  }
+  this->enable_loop();
+  return true;
+}
+
+#ifdef USE_CSI_VIDEO_OUTPUT
+void MipiCsiCamera::show_on_canvas(bool on) {
+  if (on == this->output_on_)
+    return;
+  this->output_on_ = on;
+  this->set_direct(on);
+  if (!on && this->holds_())
+    this->canvas_->close();
+  if (!on)
+    this->fit_free_();
+}
+
+bool MipiCsiCamera::fit_start_(const uint8_t *frame) {
+  uint32_t screen_w = 0, screen_h = 0;
+  if (!this->output_->page_size(&screen_w, &screen_h, this) || screen_w == 0 || screen_h == 0)
+    return false;
+  const float scale = std::floor(std::min(static_cast<float>(screen_w) / static_cast<float>(this->width_),
+                                          static_cast<float>(screen_h) / static_cast<float>(this->height_)) *
+                                 16.0f) /
+                      16.0f;
+  if (scale <= 0.0f)
+    return false;
+  const uint8_t bpp = this->bytes_per_pixel_();
+  const auto out_w = static_cast<uint16_t>(static_cast<uint32_t>(static_cast<float>(this->width_) * scale) & ~1u);
+  const auto out_h = static_cast<uint16_t>(static_cast<float>(this->height_) * scale);
+  const size_t line = CONFIG_CACHE_L2_CACHE_LINE_SIZE;
+  const size_t size = (static_cast<size_t>(out_w) * out_h * bpp + line - 1) & ~(line - 1);
+  if (size != this->fit_size_ || this->fit_buf_[0] == nullptr) {
+    if (this->holds_())
+      this->canvas_->drop_frames();
+    this->fit_free_();
+    ppa_client_config_t client{};
+    client.oper_type = PPA_OPERATION_SRM;
+    client.max_pending_trans_num = 1;
+    if (ppa_register_client(&client, &this->fit_ppa_) != ESP_OK) {
+      this->fit_ppa_ = nullptr;
+      return false;
+    }
+    ppa_event_callbacks_t cbs{};
+    cbs.on_trans_done = &MipiCsiCamera::fit_done_cb_;
+    for (auto &buf : this->fit_buf_)
+      buf = static_cast<uint8_t *>(heap_caps_aligned_calloc(line, 1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (ppa_client_register_event_callbacks(this->fit_ppa_, &cbs) != ESP_OK || this->fit_buf_[0] == nullptr ||
+        this->fit_buf_[1] == nullptr) {
+      this->fit_free_();
+      ESP_LOGW(TAG, "No PSRAM to fit %ux%u frames to the screen", this->width_, this->height_);
+      return false;
+    }
+    this->fit_size_ = size;
+    this->fit_w_ = out_w;
+    this->fit_h_ = out_h;
+  }
+  ppa_srm_oper_config_t cfg{};
+  cfg.in.buffer = frame;
+  cfg.in.pic_w = this->width_;
+  cfg.in.pic_h = this->height_;
+  cfg.in.block_w = this->width_;
+  cfg.in.block_h = this->height_;
+  cfg.in.srm_cm = bpp == 3 ? PPA_SRM_COLOR_MODE_RGB888 : PPA_SRM_COLOR_MODE_RGB565;
+  cfg.out.buffer = this->fit_buf_[this->fit_index_];
+  cfg.out.buffer_size = this->fit_size_;
+  cfg.out.pic_w = this->fit_w_;
+  cfg.out.pic_h = this->fit_h_;
+  cfg.out.srm_cm = cfg.in.srm_cm;
+  cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
+  cfg.scale_x = scale;
+  cfg.scale_y = scale;
+  cfg.mode = PPA_TRANS_MODE_NON_BLOCKING;
+  cfg.user_data = this;
+  this->fit_done_.store(false);
+  if (ppa_do_scale_rotate_mirror(this->fit_ppa_, &cfg) != ESP_OK)
+    return false;
+  this->fit_busy_ = true;
+  return true;
+}
+
+bool MipiCsiCamera::fit_done_cb_(ppa_client_handle_t client, ppa_event_data_t *event, void *arg) {
+  auto *self = static_cast<MipiCsiCamera *>(arg);
+  self->fit_done_.store(true);
+  self->enable_loop_soon_any_context();
+  return false;
+}
+
+void MipiCsiCamera::fit_finish_() {
+  if (!this->fit_busy_ || !this->fit_done_.exchange(false))
+    return;
+  this->fit_busy_ = false;
+  if (this->output_on_ && this->fit_buf_[this->fit_index_] != nullptr) {
+    uint8_t *shown_buf = this->fit_buf_[this->fit_index_];
+    esp_cache_msync(shown_buf, this->fit_size_, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    display::VideoCanvas *shown = this->output_->show_frame(shown_buf, this->fit_w_, this->fit_h_, this->framerate_,
+                                                            this->bytes_per_pixel_(), this);
+    if (shown != nullptr)
+      this->canvas_ = shown;
+    this->fit_index_ ^= 1;
+  }
+  this->release_direct_frame();
+  if (!this->output_on_)
+    this->fit_free_();
+}
+
+void MipiCsiCamera::fit_free_() {
+  if (this->fit_busy_)
+    return;
+  if (this->fit_ppa_ != nullptr) {
+    ppa_unregister_client(this->fit_ppa_);
+    this->fit_ppa_ = nullptr;
+  }
+  for (auto &buf : this->fit_buf_) {
+    heap_caps_free(buf);
+    buf = nullptr;
+  }
+  this->fit_size_ = 0;
+  this->fit_index_ = 0;
+}
+#endif
+
 bool MipiCsiCamera::select_sensor_format_() {
   esp_cam_sensor_format_t chosen{};
+  if (this->resolution_count_ == 0)
+    this->collect_resolutions_();
 
   if (this->width_ == 0) {
     // No resolution configured, so keep the format the sensor driver starts up with.
@@ -361,13 +531,22 @@ bool MipiCsiCamera::open_jpeg_() {
   if (this->encoder_.is_open())
     return true;
   jpeg_encoder_handle_t engine = this->jpeg_engine_ != nullptr ? this->jpeg_engine_() : nullptr;
+  if (this->jpeg_engine_ == nullptr) {
+    jpeg_encode_engine_cfg_t cfg{};
+    cfg.timeout_ms = JPEG_ENGINE_TIMEOUT_MS;
+    if (jpeg_new_encoder_engine(&cfg, &this->own_jpeg_engine_) != ESP_OK)
+      this->own_jpeg_engine_ = nullptr;
+    engine = this->own_jpeg_engine_;
+  }
   if (engine == nullptr) {
+    ESP_LOGE(TAG, "No JPEG encoder engine");
     return false;
   }
   const size_t jpeg_size = align_piece(JpegEncoder::output_size_for(this->expected_frame_size_));
   this->jpeg_output_ = this->alloc_(jpeg_size);
   if (this->jpeg_output_ == nullptr) {
     ESP_LOGE(TAG, "No room for the JPEG output (%zu bytes)", jpeg_size);
+    this->release_own_jpeg_engine_();
     return false;
   }
   const FormatMapping mapping = get_format_mapping(this->pixel_format_);
@@ -382,6 +561,14 @@ void MipiCsiCamera::close_jpeg_() {
     this->free_(this->jpeg_output_);
     this->jpeg_output_ = nullptr;
   }
+  this->release_own_jpeg_engine_();
+}
+
+void MipiCsiCamera::release_own_jpeg_engine_() {
+  if (this->own_jpeg_engine_ == nullptr)
+    return;
+  jpeg_del_encoder_engine(this->own_jpeg_engine_);
+  this->own_jpeg_engine_ = nullptr;
 }
 
 bool MipiCsiCamera::queue_buffer_(uint32_t index) {
@@ -437,6 +624,8 @@ bool MipiCsiCamera::start_capture_() {
     }
   }
 
+  this->settle_count_ = 0;
+  this->settle_level_ = -1;
   int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   if (ioctl(this->fd_, VIDIOC_STREAMON, &type) != 0) {
     ESP_LOGE(TAG, "Starting the video stream failed: %s", strerror(errno));
@@ -465,6 +654,18 @@ bool MipiCsiCamera::start_capture_() {
 }
 
 void MipiCsiCamera::finish_stop_() {
+#ifdef USE_CSI_VIDEO_OUTPUT
+  if (this->holds_())
+    this->canvas_->drop_frames();
+  this->fit_free_();
+#endif
+  if (this->direct_given_) {
+    this->direct_given_ = false;
+    this->direct_callback_.call(nullptr, 0, 0);
+  }
+  this->direct_held_.store(-1);
+  this->direct_returned_.store(-1);
+  this->direct_ready_.store(false);
   // The task has parked itself (suspended, nothing left to do): deleting it is safe; its stack and TCB go after
   if (this->capture_task_handle_ != nullptr) {
     vTaskDelete(this->capture_task_handle_);
@@ -483,6 +684,12 @@ void MipiCsiCamera::finish_stop_() {
     this->fd_ = -1;
   }
   this->close_jpeg_();
+  this->h264_on_.store(false);
+  this->h264_ready_.store(false);
+  if (this->h264_started_ && this->h264_free_.load()) {
+    this->h264_encoder_->stop();
+    this->h264_started_ = false;
+  }
   if (this->capture_tcb_ != nullptr) {
     heap_caps_free(this->capture_tcb_);
     this->capture_tcb_ = nullptr;
@@ -531,6 +738,7 @@ void MipiCsiCamera::dump_config() {
                 "  Frame rate: %u fps\n"
                 "  Frame buffers: %u\n"
                 "  Flip: horizontal %s, vertical %s",
+                LOG_STR_ARG(this->get_log_name()), this->sensor_name_, this->width_, this->height_,
                 get_format_mapping(this->pixel_format_).name, this->jpeg_quality_, this->framerate_,
                 this->frame_buffer_count_, flip_state(this->horizontal_flip_), flip_state(this->vertical_flip_));
   if (this->is_failed()) {
@@ -554,7 +762,13 @@ void MipiCsiCamera::capture_task(void *param) {
       self->failed_.store(true);
       break;
     }
+    const int8_t returned = self->direct_returned_.exchange(-1);
+    if (returned >= 0 && !self->queue_buffer_(static_cast<uint32_t>(returned))) {
+      ESP_LOGW(TAG, "Returning a frame buffer failed: %s", strerror(errno));
+    }
 
+    const bool settled = (buffer.flags & V4L2_BUF_FLAG_ERROR) == 0 && self->settled_(buffer.index);
+    if (self->frame_wanted_.load() && settled) {
       // The encoder is handed the whole buffer, as Espressif's reference does: the length is what
       // bounds the cache invalidation before the JPEG engine's DMA reads it.
       const FrameBuffer &frame = self->buffers_[buffer.index];
@@ -566,6 +780,9 @@ void MipiCsiCamera::capture_task(void *param) {
       self->enable_loop_soon_any_context();
       App.wake_loop_threadsafe();
     }
+
+    if (settled && self->h264_on_.load() && self->h264_free_.load())
+      self->encode_h264_(self->buffers_[buffer.index]);
 
     // Busy first, then the buffer read: a buffer ended meanwhile is either seen as gone or waited for (loop)
     self->preview_busy_.store(true);
@@ -582,6 +799,17 @@ void MipiCsiCamera::capture_task(void *param) {
     if (self->preview_ready_.load() || self->preview_released_ != nullptr) {
       self->enable_loop_soon_any_context();
       App.wake_loop_threadsafe();
+    }
+
+    // Direct: this buffer is the reader's until it comes back (direct_returned_), the driver has the others; one
+    // returned and not re-queued yet goes first (two returns between frames would lose one)
+    if (self->direct_.load() && self->direct_held_.load() < 0 && self->direct_returned_.load() < 0 &&
+        (buffer.flags & V4L2_BUF_FLAG_ERROR) == 0) {
+      self->direct_held_.store(static_cast<int8_t>(buffer.index));
+      self->direct_ready_.store(true);
+      self->enable_loop_soon_any_context();
+      App.wake_loop_threadsafe();
+      continue;
     }
 
     if (!self->queue_buffer_(buffer.index)) {
@@ -616,6 +844,11 @@ void MipiCsiCamera::loop() {
       this->disable_loop();  // the task wakes the loop once it has parked
       return;
     }
+#ifdef USE_CSI_VIDEO_OUTPUT
+    this->fit_finish_();
+    if (this->fit_busy_)
+      return;
+#endif
     const bool failed = this->failed_.load();
     this->finish_stop_();
     if (failed) {
@@ -640,6 +873,37 @@ void MipiCsiCamera::loop() {
   }
   if (this->preview_buffer_.load() != nullptr && !this->preview_wanted_.load())
     this->preview_wanted_.store(true);
+  if (this->direct_ready_.exchange(false)) {
+    const int8_t held = this->direct_held_.load();
+#ifdef USE_CSI_VIDEO_OUTPUT
+    if (held >= 0 && this->direct_.load() && this->output_on_ &&
+        !this->output_->fits(this->width_, this->height_, this->framerate_, false, this)) {
+      if (!this->fit_start_(this->buffers_[held].data))
+        this->release_direct_frame();
+    } else if (held >= 0 && this->direct_.load() && this->output_on_) {
+      const FrameBuffer &frame = this->buffers_[held];
+      esp_cache_msync(frame.data, frame.length, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+      display::VideoCanvas *shown = this->output_->show_frame(frame.data, this->width_, this->height_,
+                                                              this->framerate_, this->bytes_per_pixel_(), this);
+      if (shown != nullptr)
+        this->canvas_ = shown;
+      this->release_direct_frame();
+    } else if (held >= 0 && this->direct_.load()) {
+#else
+    if (held >= 0 && this->direct_.load()) {
+#endif
+      this->direct_given_ = true;
+      this->direct_callback_.call(this->buffers_[held].data, this->width_, this->height_);
+    } else {
+      this->release_direct_frame();
+    }
+  }
+#ifdef USE_CSI_VIDEO_OUTPUT
+  this->fit_finish_();
+  this->output_->loop();
+#endif
+
+  this->h264_step_();
 
   // Release the previous image once every consumer has finished reading it, which frees the
   // encoder's output buffer for the next frame.
@@ -673,7 +937,10 @@ void MipiCsiCamera::loop() {
     this->disable_loop();
     return;
   }
+  if ((this->preview_buffer_.load() != nullptr || this->direct_.load() || this->h264_started_) &&
+      this->single_requesters_ == 0 && this->stream_requesters_ == 0) {
     this->close_jpeg_();   // no API image wanted: the JPEG output back to the pool
+    this->disable_loop();  // only the preview / direct frames: the task wakes the loop with each frame
     return;
   }
   if (!this->has_requested_image_()) {
@@ -700,6 +967,53 @@ void MipiCsiCamera::loop() {
 
 uint8_t MipiCsiCamera::bytes_per_pixel_() const { return get_format_mapping(this->pixel_format_).bytes_per_pixel; }
 
+int32_t MipiCsiCamera::frame_level_(const FrameBuffer &frame) const {
+  const size_t bpp = this->bytes_per_pixel_();
+  const size_t pixels = std::min(frame.length, this->expected_frame_size_) / bpp;
+  if (pixels == 0)
+    return 0;
+  esp_cache_msync(frame.data, frame.length, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+  const size_t samples = std::min<size_t>(1024, pixels);
+  const size_t step = pixels / samples;
+  uint32_t sum = 0;
+  for (size_t i = 0; i < samples; i++) {
+    const uint8_t *p = frame.data + i * step * bpp;
+    switch (this->pixel_format_) {
+      case PixelFormat::PIXEL_FORMAT_RGB565: {
+        const uint16_t v = static_cast<uint16_t>(p[0] | (p[1] << 8));
+        sum += ((v >> 11) & 0x1F) * 2 + ((v >> 5) & 0x3F) + (v & 0x1F) * 2;
+        break;
+      }
+      case PixelFormat::PIXEL_FORMAT_RGB888:
+        sum += p[0] + p[1] + p[2];
+        break;
+      case PixelFormat::PIXEL_FORMAT_YUV422:
+        sum += p[1];
+        break;
+      default:
+        sum += p[0];
+        break;
+    }
+  }
+  return static_cast<int32_t>(sum / samples);
+}
+
+bool MipiCsiCamera::settled_(uint32_t index) {
+  if (this->settle_count_ == UINT16_MAX)
+    return true;
+  const int32_t level = this->frame_level_(this->buffers_[index]);
+  const int32_t last = this->settle_level_;
+  this->settle_level_ = level;
+  this->settle_count_++;
+  const int32_t delta = last < 0 ? INT32_MAX : std::abs(level - last);
+  if ((this->settle_count_ >= 3 && delta <= std::max<int32_t>(2, last / 32)) ||
+      this->settle_count_ >= 2u * this->framerate_ + 2u) {
+    this->settle_count_ = UINT16_MAX;
+    return true;
+  }
+  return false;
+}
+
 void MipiCsiCamera::set_preview_buffer(uint8_t *buffer, size_t size) {
   uint8_t *old = this->preview_buffer_.exchange(buffer);
   this->preview_size_ = size;
@@ -719,6 +1033,27 @@ void MipiCsiCamera::set_preview_buffer(uint8_t *buffer, size_t size) {
   this->enable_loop_soon_any_context();
 }
 
+void MipiCsiCamera::set_direct(bool on) {
+  this->direct_.store(on);
+  if (!on) {
+    if (this->direct_given_) {
+      this->direct_given_ = false;
+      this->direct_callback_.call(nullptr, 0, 0);
+    }
+    this->release_direct_frame();
+  }
+  this->enable_loop_soon_any_context();
+}
+
+void MipiCsiCamera::release_direct_frame() {
+  const int8_t held = this->direct_held_.load();
+  if (held < 0)
+    return;
+  this->direct_given_ = false;
+  // Returned first: the task, seeing nothing held, may take the next one; it re-queues this one after its next frame
+  this->direct_returned_.store(held);
+  this->direct_held_.store(-1);
+}
 
 void MipiCsiCamera::request_image(camera::CameraRequester requester) {
   this->single_requesters_ |= (1U << requester);
@@ -740,6 +1075,97 @@ void MipiCsiCamera::stop_stream(camera::CameraRequester requester) {
   this->stream_requesters_ &= ~(1U << requester);
   this->enable_loop_soon_any_context();
 }
+
+bool MipiCsiCamera::h264_spec_(camera::CameraImageSpec *spec) const {
+  spec->width = this->width_;
+  spec->height = this->height_;
+  if (this->pixel_format_ == PixelFormat::PIXEL_FORMAT_RGB565) {
+    spec->format = camera::PIXEL_FORMAT_RGB565;
+    return true;
+  }
+  if (this->pixel_format_ == PixelFormat::PIXEL_FORMAT_YUV422) {
+    spec->format = camera::PIXEL_FORMAT_UYVY;
+    return true;
+  }
+  return false;
+}
+
+void MipiCsiCamera::encode_h264_(const FrameBuffer &frame) {
+  this->h264_encoding_.store(true);
+  if (this->h264_on_.load()) {
+    camera::CameraImageSpec spec{};
+    this->h264_spec_(&spec);
+    FrameView view(frame.data, this->expected_frame_size_);
+    if (this->h264_encoder_->encode_pixels(&spec, &view) == camera::ENCODER_ERROR_SUCCESS) {
+      this->h264_length_.store(this->h264_encoder_->get_output_buffer()->get_size());
+      this->h264_key_.store(this->h264_encoder_->is_key_frame());
+      this->h264_free_.store(false);
+      this->h264_ready_.store(true);
+    }
+  }
+  this->h264_encoding_.store(false);
+  this->enable_loop_soon_any_context();
+  App.wake_loop_threadsafe();
+}
+
+void MipiCsiCamera::h264_step_() {
+  if (this->h264_encoder_ == nullptr)
+    return;
+  const uint8_t requesters = this->h264_requesters_.load();
+  if (requesters != 0 && !this->h264_started_ && this->state_ == State::RUNNING) {
+    camera::CameraImageSpec spec{};
+    if (!this->h264_spec_(&spec) || !this->h264_encoder_->start(spec)) {
+      ESP_LOGE(TAG, "No H.264 stream for this camera format; the H.264 requests are dropped");
+      this->h264_requesters_.store(0);
+      return;
+    }
+    this->h264_started_ = true;
+    this->h264_free_.store(true);
+    this->h264_ready_.store(false);
+    this->h264_on_.store(true);
+  }
+  if (this->h264_ready_.exchange(false)) {
+    auto image = std::make_shared<MipiCsiH264Image>(this, this->h264_encoder_->get_output_buffer()->get_data(),
+                                                    this->h264_length_.load(), requesters, this->h264_key_.load());
+    for (auto *listener : this->listeners_)
+      listener->on_camera_image(image);
+  }
+  if (requesters == 0 && this->h264_started_) {
+    this->h264_on_.store(false);
+    if (!this->h264_encoding_.load() && this->h264_free_.load()) {
+      this->h264_encoder_->stop();
+      this->h264_started_ = false;
+    }
+  }
+}
+
+void MipiCsiCamera::start_stream_as(camera::CameraRequester requester, camera::ImageFormat format) {
+  if (format == camera::IMAGE_FORMAT_JPEG) {
+    this->start_stream(requester);
+    return;
+  }
+  if (this->h264_encoder_ == nullptr)
+    return;
+  this->h264_requesters_.fetch_or(static_cast<uint8_t>(1U << requester));
+  this->h264_encoder_->request_key_frame();
+  this->enable_loop_soon_any_context();
+}
+
+void MipiCsiCamera::stop_stream_as(camera::CameraRequester requester, camera::ImageFormat format) {
+  if (format == camera::IMAGE_FORMAT_JPEG) {
+    this->stop_stream(requester);
+    return;
+  }
+  this->h264_requesters_.fetch_and(static_cast<uint8_t>(~(1U << requester)));
+  this->enable_loop_soon_any_context();
+}
+
+void MipiCsiCamera::request_key_frame() {
+  if (this->h264_encoder_ != nullptr)
+    this->h264_encoder_->request_key_frame();
+}
+
+MipiCsiH264Image::~MipiCsiH264Image() { this->camera_->on_h264_released(); }
 
 /* ---------------- MipiCsiImageReader ---------------- */
 
