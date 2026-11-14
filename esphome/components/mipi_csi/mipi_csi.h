@@ -14,11 +14,16 @@
 #include <esp_cam_sensor_types.h>
 
 #include "esphome/components/camera/camera.h"
+#include "esphome/components/camera/encoder.h"
 #include "esphome/components/i2c/i2c_bus.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/helpers.h"
 
 #include "jpeg_encoder.h"
+#ifdef USE_CSI_VIDEO_OUTPUT
+#include "esphome/components/display/video_output.h"
+#include <driver/ppa.h>
+#endif
 
 namespace esphome::mipi_csi {
 
@@ -62,6 +67,28 @@ class MipiCsiImage : public camera::CameraImage {
 
 class MipiCsiCamera;
 
+class MipiCsiH264Image : public camera::CameraImage {
+ public:
+  MipiCsiH264Image(MipiCsiCamera *camera, uint8_t *data, size_t length, uint8_t requesters, bool key)
+      : camera_(camera), data_(data), length_(length), requesters_(requesters), key_(key) {}
+  ~MipiCsiH264Image() override;
+
+  uint8_t *get_data_buffer() override { return this->data_; }
+  size_t get_data_length() override { return this->length_; }
+  bool was_requested_by(camera::CameraRequester requester) const override {
+    return (this->requesters_ & (1U << requester)) != 0;
+  }
+  camera::ImageFormat get_format() const override { return camera::IMAGE_FORMAT_H264; }
+  bool is_key_frame() const override { return this->key_; }
+
+ protected:
+  MipiCsiCamera *camera_;
+  uint8_t *data_;
+  size_t length_;
+  uint8_t requesters_;
+  bool key_;
+};
+
 /// Tracks how far a consumer has read into an image; tells the camera when it gives the image back.
 class MipiCsiImageReader : public camera::CameraImageReader {
  public:
@@ -93,12 +120,32 @@ using BufferFree = void (*)(uint8_t *ptr);
 /// capture task and every buffer are set up then and given back after (the buffers from the allocator).
 class MipiCsiCamera final : public camera::Camera {
  public:
+  static constexpr uint8_t MAX_RESOLUTIONS = 8;
+  struct Resolution {
+    uint16_t width;
+    uint16_t height;
+    uint8_t fps;
+  };
+  void add_resolution(uint16_t width, uint16_t height, uint8_t fps);
+  uint8_t resolution_count() const { return this->resolution_count_; }
+  const Resolution &resolution(uint8_t index) const { return this->resolutions_[index]; }
+  bool switch_resolution(uint16_t width, uint16_t height);
+#ifdef USE_CSI_VIDEO_OUTPUT
+  void set_video_output(display::VideoOutput *output) { this->output_ = output; }
+  bool can_show(uint16_t width, uint16_t height, uint8_t fps) const {
+    return this->output_->fits(width, height, fps, false, this);
+  }
+  void show_on_canvas(bool on);
+  bool is_shown_on_canvas() const { return this->output_on_; }
+#endif
   void set_buffer_allocator(BufferAlloc alloc, BufferFree free) {
     this->alloc_ = alloc;
     this->free_ = free;
   }
   /// The HW JPEG encoder engine to encode with (shared with others; nullptr while none exists).
   void set_jpeg_encoder(jpeg_encoder_handle_t (*engine)()) { this->jpeg_engine_ = engine; }
+  void set_h264_encoder(camera::Encoder *encoder) { this->h264_encoder_ = encoder; }
+  camera::Encoder *get_h264_encoder() const { return this->h264_encoder_; }
   void set_sensor_name(const char *sensor_name) { this->sensor_name_ = sensor_name; }
   void set_resolution(uint16_t width, uint16_t height) {
     this->width_ = width;
@@ -133,11 +180,24 @@ class MipiCsiCamera final : public camera::Camera {
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::LATE; }
 
-  void add_listener(camera::CameraListener *listener) override { this->listeners_.push_back(listener); }
+  void add_listener(camera::CameraListener *listener) override {
+    this->listeners_.push_back(listener);
+    camera::note_listener(this->listeners_, listener);
+  }
   camera::CameraImageReader *create_image_reader() override { return new MipiCsiImageReader(this); }  // NOLINT
   void request_image(camera::CameraRequester requester) override;
   void start_stream(camera::CameraRequester requester) override;
   void stop_stream(camera::CameraRequester requester) override;
+  bool supports_format(camera::ImageFormat format) const override {
+    return format == camera::IMAGE_FORMAT_JPEG || this->h264_encoder_ != nullptr;
+  }
+  void start_stream_as(camera::CameraRequester requester, camera::ImageFormat format) override;
+  void stop_stream_as(camera::CameraRequester requester, camera::ImageFormat format) override;
+  void request_key_frame() override;
+  void on_h264_released() {
+    this->h264_free_.store(true);
+    this->enable_loop_soon_any_context();
+  }
   /// Main loop: every frame copied raw (the capture format) into @p buffer while it is set; the stream runs while
   /// set. nullptr ends it: the buffer goes back through the released callback once no copy into it is under way.
   void set_preview_buffer(uint8_t *buffer, size_t size);
@@ -168,6 +228,17 @@ class MipiCsiCamera final : public camera::Camera {
     size_t length;
   };
 
+  class FrameView : public camera::Buffer {
+   public:
+    FrameView(uint8_t *data, size_t length) : data_(data), length_(length) {}
+    uint8_t *get_data_buffer() override { return this->data_; }
+    size_t get_data_length() override { return this->length_; }
+
+   protected:
+    uint8_t *data_;
+    size_t length_;
+  };
+
   enum class State : uint8_t { IDLE, RUNNING, STOPPING };
 
   bool start_external_clock_();
@@ -182,8 +253,10 @@ class MipiCsiCamera final : public camera::Camera {
   /// Main loop: the JPEG output (a pool piece) and the engine while API images are asked for; given back after.
   bool open_jpeg_();
   void close_jpeg_();
+  void release_own_jpeg_engine_();
   /// Logs every MIPI-CSI format the sensor offers, used when the configured resolution is rejected.
   void log_sensor_formats_();
+  void collect_resolutions_();
   /// Ranks two sensor formats of the same resolution against each other.
   bool is_better_sensor_format_(const esp_cam_sensor_format_t &candidate, const esp_cam_sensor_format_t &current) const;
   /// Reduces the configured frame rate to one the driver can actually produce.
@@ -194,8 +267,14 @@ class MipiCsiCamera final : public camera::Camera {
   bool read_back_format_(uint32_t expected_fourcc, uint8_t bytes_per_pixel, const char *name);
   bool has_requested_image_() const {
     return this->single_requesters_ != 0 || this->stream_requesters_ != 0 || this->preview_buffer_.load() != nullptr ||
+           this->direct_.load() || this->h264_requesters_.load() != 0 || this->h264_started_;
   }
+  bool h264_spec_(camera::CameraImageSpec *spec) const;
+  void h264_step_();
+  void encode_h264_(const FrameBuffer &frame);
   uint8_t bytes_per_pixel_() const;
+  bool settled_(uint32_t index);
+  int32_t frame_level_(const FrameBuffer &frame) const;
 
   static void capture_task(void *param);
 
@@ -232,6 +311,7 @@ class MipiCsiCamera final : public camera::Camera {
   BufferAlloc alloc_{nullptr};
   BufferFree free_{nullptr};
   jpeg_encoder_handle_t (*jpeg_engine_)(){nullptr};
+  jpeg_encoder_handle_t own_jpeg_engine_{nullptr};
   State state_{State::IDLE};
   bool video_ready_{false};
   FixedVector<FrameBuffer> buffers_;
@@ -243,6 +323,8 @@ class MipiCsiCamera final : public camera::Camera {
   uint8_t *capture_stack_{nullptr};
   /// Set by the main loop to ask the capture task for one frame, cleared by the task when done.
   std::atomic<bool> frame_wanted_{false};
+  uint16_t settle_count_{0};
+  int32_t settle_level_{-1};
   /// The capture task's result for the main loop: valid once result_ready_ is set (0 = encoding failed).
   std::atomic<size_t> result_length_{0};
   std::atomic<bool> result_ready_{false};
@@ -268,11 +350,40 @@ class MipiCsiCamera final : public camera::Camera {
   std::atomic<bool> direct_ready_{false};
   bool direct_given_{false};
   CallbackManager<void(const uint8_t *, uint16_t, uint16_t)> direct_callback_;
+  Resolution resolutions_[MAX_RESOLUTIONS]{};
+  uint8_t resolution_count_{0};
+#ifdef USE_CSI_VIDEO_OUTPUT
+  bool holds_() const { return this->canvas_ != nullptr && this->canvas_->held_by(this); }
+  display::VideoOutput *output_{nullptr};
+  display::VideoCanvas *canvas_{nullptr};
+  bool output_on_{false};
+  bool fit_start_(const uint8_t *frame);
+  void fit_finish_();
+  void fit_free_();
+  static bool fit_done_cb_(ppa_client_handle_t client, ppa_event_data_t *event, void *arg);
+  ppa_client_handle_t fit_ppa_{nullptr};
+  uint8_t *fit_buf_[2]{nullptr, nullptr};
+  size_t fit_size_{0};
+  uint16_t fit_w_{0};
+  uint16_t fit_h_{0};
+  uint8_t fit_index_{0};
+  bool fit_busy_{false};
+  std::atomic<bool> fit_done_{false};
+#endif
 
   std::shared_ptr<MipiCsiImage> current_image_;
   std::vector<camera::CameraListener *> listeners_;
   std::atomic<uint8_t> single_requesters_{0};
   std::atomic<uint8_t> stream_requesters_{0};
+  camera::Encoder *h264_encoder_{nullptr};
+  std::atomic<uint8_t> h264_requesters_{0};
+  bool h264_started_{false};
+  std::atomic<bool> h264_on_{false};
+  std::atomic<bool> h264_free_{true};
+  std::atomic<bool> h264_encoding_{false};
+  std::atomic<bool> h264_ready_{false};
+  std::atomic<size_t> h264_length_{0};
+  std::atomic<bool> h264_key_{false};
   /// Requesters recorded when the frame currently being captured was asked for.
   uint8_t pending_requesters_{0};
 };
@@ -281,6 +392,8 @@ class MipiCsiImageTrigger final : public Trigger<CameraImageData>, public camera
  public:
   explicit MipiCsiImageTrigger(MipiCsiCamera *parent) { parent->add_listener(this); }
   void on_camera_image(const std::shared_ptr<camera::CameraImage> &image) override {
+    if (image->get_format() == camera::IMAGE_FORMAT_JPEG)
+      this->trigger(CameraImageData{image->get_data_buffer(), image->get_data_length()});
   }
 };
 
