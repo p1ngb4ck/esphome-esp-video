@@ -21,7 +21,6 @@ static constexpr uint32_t FLIP_WAIT_MS = 100;
 static constexpr size_t SOUND_RING = 64 * 1024;
 static constexpr size_t SOUND_DECODER_IN = 64 * 1024;
 static constexpr size_t SOUND_DECODER_OUT = 32 * 1024;
-static constexpr size_t PCM_CHUNK = 4096;
 
 #ifdef USE_SPEAKER
 class PsramRing : public ring_buffer::RingBuffer {
@@ -88,17 +87,14 @@ void AviMediaPlayer::control(const media_player::MediaPlayerCall &call) {
   const bool enqueue =
       call.get_command().has_value() && call.get_command().value() == media_player::MEDIA_PLAYER_COMMAND_ENQUEUE;
   if (call.get_media_url().has_value()) {
-    std::string url = call.get_media_url().value();
-    if (url.rfind("file://", 0) == 0)
-      url.erase(0, 7);
     if (enqueue) {
-      this->list_.push_back(url);
+      this->list_.push_back(call.get_media_url().value());
       if (this->run_.load() == RUN_IDLE && this->pending_ < 0)
         this->play_index_(this->list_.size() - 1);
       return;
     }
     this->list_.clear();
-    this->list_.push_back(url);
+    this->list_.push_back(call.get_media_url().value());
     this->play_index_(0);
     return;
   }
@@ -168,16 +164,11 @@ bool AviMediaPlayer::start_(const std::string &path) {
     return false;
   }
   this->path_ = path;
-  this->error_.store(ERROR_NONE);
-  if (this->latency_fn_)
-    this->set_audio_latency(this->latency_fn_());
-  this->sound_hold_ms_ = this->audio_latency_us_ < 0 ? static_cast<uint32_t>(-this->audio_latency_us_ / 1000) : 0;
   this->ring_ = psram_piece(this->ring_size_);
   this->frame_ = psram_piece(this->frame_size_);
   if (this->ring_ == nullptr || this->frame_ == nullptr) {
     ESP_LOGE(TAG, "No memory for %s (largest PSRAM block %zu)", path.c_str(),
              heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-    this->error_.store(ERROR_MEMORY);
     this->release_();
     return false;
   }
@@ -276,8 +267,6 @@ void AviMediaPlayer::release_() {
   this->sound_ring_.reset();
   heap_caps_free(this->sound_mem_);
   this->sound_mem_ = nullptr;
-  this->pcm_chunk_ = nullptr;
-  this->pcm_held_ = false;
 #endif
   this->sink_.store(nullptr);
   this->parser_.reset();
@@ -333,19 +322,16 @@ bool AviMediaPlayer::open_() {
       this->room_cb_(this->room_arg_);
   } else if (!this->reader_->open(this->path_.c_str())) {
     ESP_LOGE(TAG, "%s not opened", this->path_.c_str());
-    this->error_.store(ERROR_NOT_FOUND);
     return false;
   }
   this->parser_ = std::make_unique<AVIParser>();
   if (!this->parser_->open(this->reader_.get())) {
     ESP_LOGE(TAG, "%s is no AVI", this->path_.c_str());
-    this->error_.store(ERROR_FORMAT);
     return false;
   }
   const AVIStreamInfo *video = this->parser_->get_video_info();
   if (video == nullptr || video->fps_num == 0) {
     ESP_LOGE(TAG, "%s has no video stream", this->path_.c_str());
-    this->error_.store(ERROR_FORMAT);
     return false;
   }
   this->frame_us_ = static_cast<uint32_t>(1000000ull * video->fps_den / video->fps_num);
@@ -354,7 +340,6 @@ bool AviMediaPlayer::open_() {
   if (this->canvas_ == nullptr) {
     ESP_LOGE(TAG, "%s is %" PRIu32 "x%" PRIu32 " at %" PRIu32 " fps: no canvas or screen output takes it",
              this->path_.c_str(), video->width, video->height, fps);
-    this->error_.store(ERROR_FORMAT);
     return false;
   }
   this->pcm_ = false;
@@ -365,8 +350,6 @@ bool AviMediaPlayer::open_() {
       this->speaker_->set_audio_stream_info(
           audio::AudioStreamInfo(16, static_cast<uint8_t>(audio->channels), audio->sample_rate));
       this->pcm_ = true;
-      if (this->sound_hold_ms_ > 0 && !this->pcm_hold_start_(audio))
-        ESP_LOGW(TAG, "%s: no PSRAM to hold its sound %" PRIu32 " ms", this->path_.c_str(), this->sound_hold_ms_);
     } else if (!this->sound_start_(audio)) {
       ESP_LOGW(TAG, "%s: its sound (codec 0x%04" PRIX32 ") is not played", this->path_.c_str(), audio->codec);
     }
@@ -376,19 +359,17 @@ bool AviMediaPlayer::open_() {
 }
 
 void AviMediaPlayer::task_() {
-  if (this->open_()) {
-    this->run_.store(RUN_PLAYING);
-    this->played_to_end_.store(false);
-    this->play_();
-    this->played_to_end_.store(this->run_.load() == RUN_PLAYING);
-    if (this->canvas_ != nullptr)
-      this->canvas_->stop_feed();
+  if (!this->open_())
+    return;
+  this->run_.store(RUN_PLAYING);
+  this->played_to_end_.store(false);
+  this->play_();
+  this->played_to_end_.store(this->run_.load() == RUN_PLAYING);
+  if (this->canvas_ != nullptr)
+    this->canvas_->stop_feed();
 #ifdef USE_SPEAKER
-    this->sound_stop_();
+  this->sound_stop_();
 #endif
-  }
-  if (this->reader_ != nullptr)
-    this->reader_->close();
 }
 
 void AviMediaPlayer::play_() {
@@ -397,7 +378,7 @@ void AviMediaPlayer::play_() {
                      || this->sound_ring_ != nullptr
 #endif
       ;
-  int64_t due = esp_timer_get_time() + (sound && this->audio_latency_us_ > 0 ? this->audio_latency_us_ : 0);
+  int64_t due = esp_timer_get_time() + (sound ? this->audio_latency_us_ : 0);
   while (true) {
     uint8_t run = this->run_.load();
     if (run == RUN_PAUSED && this->canvas_ != nullptr)
@@ -412,7 +393,7 @@ void AviMediaPlayer::play_() {
     AVIFrame frame{};
     int n = this->parser_->read_next_frame(frame, this->frame_, this->frame_size_);
     while (n > 0 && frame.stream_type != AVIStreamType::VIDEO) {
-      if (frame.stream_type == AVIStreamType::AUDIO && this->pcm_ && !this->pcm_held_)
+      if (frame.stream_type == AVIStreamType::AUDIO && this->pcm_)
         this->sound_(this->frame_, static_cast<size_t>(n));
 #ifdef USE_SPEAKER
       if (frame.stream_type == AVIStreamType::AUDIO && this->sound_ring_ != nullptr)
@@ -429,16 +410,14 @@ void AviMediaPlayer::play_() {
       return;
     this->wait_until_(due);
     due += this->frame_us_;
-    const bool shown = this->show_picture_(this->frame_, static_cast<size_t>(n));
-    if (!shown && !this->frame_failed_) {
+    const bool shown = this->frame_(this->frame_, static_cast<size_t>(n));
+    if (!shown && !this->frame_failed_)
       ESP_LOGW(TAG, "Frames of %s not decoded", this->path_.c_str());
-      this->error_.store(ERROR_DECODE);
-    }
     this->frame_failed_ = !shown;
   }
 }
 
-bool AviMediaPlayer::show_picture_(const uint8_t *data, size_t len) {
+bool AviMediaPlayer::frame_(const uint8_t *data, size_t len) {
   return this->canvas_ != nullptr && this->canvas_->frame(data, len, FLIP_WAIT_MS);
 }
 
@@ -488,26 +467,6 @@ bool AviMediaPlayer::sound_start_(const AVIStreamInfo *info) {
     return false;
   if (info->stream_header_len != 0 && static_cast<AVIAudioCodec>(info->codec) == AVIAudioCodec::FLAC)
     this->sound_ring_->write(info->stream_header, info->stream_header_len);
-  return this->sound_task_start_();
-}
-
-bool AviMediaPlayer::pcm_hold_start_(const AVIStreamInfo *info) {
-  const size_t frame_bytes = 2u * info->channels;
-  const size_t hold = static_cast<size_t>(static_cast<uint64_t>(info->sample_rate) * this->sound_hold_ms_ / 1000u) *
-                      frame_bytes;
-  const size_t ring = hold + SOUND_RING;
-  this->sound_mem_ = psram_piece(ring + PCM_CHUNK);
-  if (this->sound_mem_ == nullptr)
-    return false;
-  this->sound_ring_ = PsramRing::make(this->sound_mem_, ring);
-  if (this->sound_ring_ == nullptr)
-    return false;
-  this->pcm_chunk_ = this->sound_mem_ + ring;
-  this->pcm_held_ = true;
-  return this->sound_task_start_();
-}
-
-bool AviMediaPlayer::sound_task_start_() {
   this->sound_end_.store(false);
   this->sound_eof_.store(false);
   this->sound_done_.store(false);
@@ -518,28 +477,6 @@ bool AviMediaPlayer::sound_task_start_() {
     return false;
   }
   return true;
-}
-
-void AviMediaPlayer::pcm_loop_() {
-  while (!this->sound_end_.load()) {
-    if (this->run_.load() == RUN_PAUSED) {
-      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-      continue;
-    }
-    const size_t got = this->sound_ring_->read(this->pcm_chunk_, PCM_CHUNK, pdMS_TO_TICKS(20));
-    if (got == 0) {
-      if (this->sound_eof_.load() && this->sound_ring_->available() == 0)
-        return;
-      continue;
-    }
-    const uint8_t *data = this->pcm_chunk_;
-    size_t left = got;
-    while (left > 0 && !this->sound_end_.load()) {
-      const size_t written = this->speaker_->play(data, left, pdMS_TO_TICKS(20));
-      data += written;
-      left -= written;
-    }
-  }
 }
 
 void AviMediaPlayer::sound_chunk_(const uint8_t *data, size_t len) {
@@ -575,12 +512,6 @@ void AviMediaPlayer::sound_entry_(void *arg) {
 }
 
 void AviMediaPlayer::sound_loop_() {
-  if (this->sound_hold_ms_ > 0)
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(this->sound_hold_ms_));
-  if (this->pcm_held_) {
-    this->pcm_loop_();
-    return;
-  }
   while (!this->sound_end_.load()) {
     if (this->run_.load() == RUN_PAUSED) {
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
