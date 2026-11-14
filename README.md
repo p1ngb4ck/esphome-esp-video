@@ -105,3 +105,39 @@ cameras on the ESP32-P4. Thank you, Mallow ([youkorr](https://github.com/youkorr
 build on your ESP32-P4 work, and the extra OV02C10 resolutions come from your esp_video. The OV02C10 driver and
 esp_ipa are Espressif's (Apache-2.0). Everyone this project builds on:
 [ATTRIBUTIONS.md](https://github.com/p1ngb4ck/esphome/blob/dev/ATTRIBUTIONS.md).
+
+## Branch structure
+
+Each `pr/` branch holds one part of this topic on top of upstream and says in its `BRANCH.md` what it is based on. `main` holds all of them.
+
+| Branch | Based on |
+|---|---|
+| `pr/api-camera-jpeg-only` | `pr/camera-encoder-h264` |
+| `pr/apps` | upstream only |
+| `pr/avi` | `pr/storage` of p1ngb4ck/esphome-storage-interface |
+| `pr/avi-media-player` | `pr/avi`, `pr/esp32-require-hw-jpeg`, `pr/lvgl-remote-input` of p1ngb4ck/esphome-hid, `pr/lvgl-color-depth-32` of p1ngb4ck/esphome-mipi-display, `pr/mipi-dsi-scanout` of p1ngb4ck/esphome-mipi-display |
+| `pr/camera-encoder-h264` | upstream only |
+| `pr/camera-encoder-option` | `pr/esp32-require-h264-encoder`, `pr/mipi-csi-hw-jpeg` |
+| `pr/display-video-output` | `pr/esp32-require-hw-jpeg`, `pr/lvgl-remote-input` of p1ngb4ck/esphome-hid, `pr/lvgl-color-depth-32` of p1ngb4ck/esphome-mipi-display, `pr/mipi-dsi-scanout` of p1ngb4ck/esphome-mipi-display |
+| `pr/display-video-output-page-draw` | `pr/display-video-output` |
+| `pr/display-video-output-rows` | `pr/display-video-output-page-draw` |
+| `pr/esp32-require-h264-encoder` | `pr/camera-encoder-h264`, `pr/esp32-require-hw-jpeg` |
+| `pr/esp32-require-hw-jpeg` | upstream only |
+| `pr/media-player-options` | `pr/esp32-require-hw-jpeg`, `pr/online-image-path-source`, `pr/lvgl-remote-input` of p1ngb4ck/esphome-hid, `pr/lvgl-color-depth-32` of p1ngb4ck/esphome-mipi-display, `pr/mipi-dsi-scanout` of p1ngb4ck/esphome-mipi-display, `pr/fixed-containers` of p1ngb4ck/esphome-relay-link |
+| `pr/mipi-csi` | upstream only |
+| `pr/mipi-csi-controls` | `pr/mipi-csi-esp-ipa` |
+| `pr/mipi-csi-define` | `pr/mipi-csi-ov02c10` |
+| `pr/mipi-csi-direct-frames` | `pr/mipi-csi-controls` |
+| `pr/mipi-csi-esp-ipa` | `pr/mipi-csi-on-demand` |
+| `pr/mipi-csi-exposure-settle` | `pr/mipi-csi-log-name` |
+| `pr/mipi-csi-h264` | `pr/camera-encoder-h264`, `pr/mipi-csi-exposure-settle` |
+| `pr/mipi-csi-hw-jpeg` | `pr/esp32-require-hw-jpeg`, `pr/mipi-csi-define` |
+| `pr/mipi-csi-log-name` | `pr/mipi-csi-direct-frames` |
+| `pr/mipi-csi-on-demand` | `pr/mipi-csi`, `pr/esp32-idf-component-override-path` of p1ngb4ck/esphome-esp32-platform |
+| `pr/mipi-csi-ov02c10` | `pr/mipi-csi-h264` |
+| `pr/mipi-csi-video-output` | `pr/camera-encoder-option`, `pr/lvgl-remote-input` of p1ngb4ck/esphome-hid, `pr/lvgl-color-depth-32` of p1ngb4ck/esphome-mipi-display, `pr/mipi-dsi-scanout` of p1ngb4ck/esphome-mipi-display |
+| `pr/online-image-path-source` | `pr/storage` of p1ngb4ck/esphome-storage-interface |
+| `pr/rtsp-server-h264` | `pr/camera-encoder-h264` |
+| `pr/runtime-image-jpeg-decoder` | `pr/esp32-require-hw-jpeg` |
+| `pr/screen-capture` | `pr/avi`, `pr/display-video-output` |
+| `pr/stream-receiver` | `pr/avi`, `pr/display-video-output` |
