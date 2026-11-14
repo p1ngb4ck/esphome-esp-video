@@ -6,9 +6,7 @@ Change of this branch: media_player: `pictures`, `controls`, `queue`, `extended_
 
 Based on these branches, whose changes it holds and builds on:
 
-- `pr/esp32-require-hw-jpeg`: esp32 `require_hw_jpeg()`: the JPEG codec for the chip (P4 hardware JPEG, S2 / S3 esp_new_jpeg, others JPEGDEC)
+- `pr/display-video-output-page-draw`: display: page draw calls (`page_rect`, `page_fill`, `page_pixels`, `page_copy`, `page_read`, `page_show`, `page_bpp`, `canvas_point`)
+- `pr/display-video-output-rows`: display: `open_rows`, `rows_begin` / `rows_end` for a writer of its own, `rotation()`, `display()`
 - `pr/online-image-path-source`: online_image: `url` or `path`, a local path through the storage interface
-- `pr/lvgl-remote-input` of p1ngb4ck/esphome-hid: `lvgl` `remote_input`: LVGL from outside (pointer, keys by key binding action, text), keys fire their action while LVGL is paused
-- `pr/lvgl-color-depth-32` of p1ngb4ck/esphome-mipi-display: lvgl `color_depth: 32` as RGB888 (3 bytes per pixel)
-- `pr/mipi-dsi-scanout` of p1ngb4ck/esphome-mipi-display: mipi_dsi `frame_buffers` (up to 3), the frame buffers handed to a direct client and flipped at the frame end, the scanout interface, LVGL drawing straight into the frame buffers with two of them
-- `pr/fixed-containers` of p1ngb4ck/esphome-relay-link: `fixed_containers`: `FixedString`, `TextView`, `FixedList` (fixed-size texts and lists, no heap growth)
+- `pr/relay-link` of p1ngb4ck/esphome-relay-link: `relay_link`: the link to the relay integration (URL, token and stream port through `relay_link_set`, kept in the preferences), one task for the consumers' requests, `http_at()` for their plain HTTP sources
